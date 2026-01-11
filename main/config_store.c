@@ -5,6 +5,10 @@
 #include <stdbool.h>
 #include <stdio.h>  // snprintf
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+
 #include "esp_log.h"
 #include "esp_err.h"
 #include "nvs.h"
@@ -13,6 +17,7 @@
 #include "esp_heap_caps.h"
 
 #include "config_store.h"
+#include "display_uart.h"
 
 static const char *TAG = "CFG";
 
@@ -22,8 +27,77 @@ static const char *TAG = "CFG";
  */
 static foot_config_t *s_cfg = NULL;
 
+// forward (used by v5 unpack)
+static void set_defaults(foot_config_t *cfg);
+
 // ✅ สถานะ NVS (กัน abort/รีบูต)
 static bool s_nvs_ok = false;
+
+// ---- config persistence (async + coalesce) ----
+static SemaphoreHandle_t s_cfg_mtx = NULL;
+static TaskHandle_t s_cfg_save_task = NULL;
+static volatile uint32_t s_cfg_seq = 0;
+static volatile bool s_cfg_dirty = false;
+
+static void cfg_lock(void)   { if (s_cfg_mtx) xSemaphoreTake(s_cfg_mtx, portMAX_DELAY); }
+static void cfg_unlock(void) { if (s_cfg_mtx) xSemaphoreGive(s_cfg_mtx); }
+
+static void cfg_request_save(void)
+{
+    if (!s_nvs_ok) return;
+    if (!s_cfg_save_task) return;
+
+    s_cfg_dirty = true;
+    s_cfg_seq++;
+    xTaskNotifyGive(s_cfg_save_task);
+}
+
+static esp_err_t nvs_save_v5_packed(const foot_config_t *in);
+
+static void cfg_save_task(void *arg)
+{
+    (void)arg;
+
+    uint32_t last_seq = 0;
+
+    while (1) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        // debounce/coalesce: รอจน "นิ่ง" สักพัก
+        vTaskDelay(pdMS_TO_TICKS(250));
+        while (ulTaskNotifyTake(pdTRUE, 0) > 0) {
+            vTaskDelay(pdMS_TO_TICKS(120));
+        }
+
+        if (!s_cfg_dirty) continue;
+
+        // snapshot (ห้ามวาง foot_config_t บน stack เพราะมันใหญ่มาก)
+        foot_config_t *snap = (foot_config_t *)heap_caps_malloc(sizeof(*snap), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!snap) snap = (foot_config_t *)heap_caps_malloc(sizeof(*snap), MALLOC_CAP_8BIT);
+        if (!snap) {
+            ESP_LOGE(TAG, "cfg snapshot alloc failed");
+            continue;
+        }
+
+        cfg_lock();
+        memcpy(snap, s_cfg, sizeof(*snap));
+        last_seq = s_cfg_seq;
+        cfg_unlock();
+
+        esp_err_t e = nvs_save_v5_packed(snap);
+        heap_caps_free(snap);
+
+        if (e == ESP_OK) {
+            s_cfg_dirty = false;
+            ESP_LOGI(TAG, "cfg saved (v5 packed) seq=%u", (unsigned)last_seq);
+        } else {
+            ESP_LOGE(TAG, "cfg save failed: %s", esp_err_to_name(e));
+            // keep dirty; next notify will retry
+        }
+    }
+}
+
+
 
 // ---- led brightness stored separately ----
 static uint8_t s_led_brightness = 100; // 0..100
@@ -39,7 +113,7 @@ static uint8_t s_cur_bank = 0;
 static expfs_port_cfg_t s_expfs[EXPFS_PORT_COUNT];
 
 #define CFG_MAGIC 0x46435346u  // 'FSCF'
-#define CFG_VER   4            // v4 = no pages
+#define CFG_VER   5            // v4 = no pages
 
 typedef struct __attribute__((packed)) {
     uint32_t magic;
@@ -496,7 +570,7 @@ static esp_err_t nvs_load_v4(foot_config_t *out)
         return ESP_FAIL;
     }
 
-    if (hdr.magic != CFG_MAGIC || hdr.ver != CFG_VER || hdr.size != sizeof(foot_config_t)) {
+    if (hdr.magic != CFG_MAGIC || hdr.ver != 4 || hdr.size != sizeof(foot_config_t)) {
         nvs_close(h);
         return ESP_FAIL;
     }
@@ -606,7 +680,7 @@ static esp_err_t nvs_save_v4(const foot_config_t *in)
     cfg_hdr_v4_t hdr;
     memset(&hdr, 0, sizeof(hdr));
     hdr.magic = CFG_MAGIC;
-    hdr.ver   = CFG_VER;
+    hdr.ver   = 4;
     hdr.size  = (uint32_t)sizeof(foot_config_t);
 
     nvs_handle_t h;
@@ -621,6 +695,175 @@ static esp_err_t nvs_save_v4(const foot_config_t *in)
     if (e != ESP_OK) ESP_LOGE(TAG, "nvs_save_v4 failed: %s", esp_err_to_name(e));
     return e;
 }
+
+// -------------------- v5 packed config (ลดขนาด + ลดโอกาส NVS เต็ม) --------------------
+static size_t cfg_v5_packed_size(int bank_count)
+{
+    if (bank_count < 1) bank_count = 1;
+    if (bank_count > MAX_BANKS) bank_count = MAX_BANKS;
+
+    // [u8 bank_count] + bank_name + switch_name + map
+    return (size_t)1
+         + (size_t)bank_count * (size_t)NAME_LEN
+         + (size_t)bank_count * (size_t)NUM_BTNS * (size_t)NAME_LEN
+         + (size_t)bank_count * (size_t)NUM_BTNS * sizeof(btn_map_t);
+}
+
+static esp_err_t cfg_v5_pack(const foot_config_t *in, uint8_t **out_buf, size_t *out_len)
+{
+    if (!in || !out_buf || !out_len) return ESP_ERR_INVALID_ARG;
+
+    int bc = (int)in->bank_count;
+    if (bc < 1) bc = 1;
+    if (bc > MAX_BANKS) bc = MAX_BANKS;
+
+    size_t need = cfg_v5_packed_size(bc);
+
+    uint8_t *buf = (uint8_t *)heap_caps_malloc(need, MALLOC_CAP_8BIT);
+    if (!buf) return ESP_ERR_NO_MEM;
+
+    uint8_t *p = buf;
+    *p++ = (uint8_t)bc;
+
+    memcpy(p, in->bank_name, (size_t)bc * (size_t)NAME_LEN);
+    p += (size_t)bc * (size_t)NAME_LEN;
+
+    memcpy(p, in->switch_name, (size_t)bc * (size_t)NUM_BTNS * (size_t)NAME_LEN);
+    p += (size_t)bc * (size_t)NUM_BTNS * (size_t)NAME_LEN;
+
+    memcpy(p, in->map, (size_t)bc * (size_t)NUM_BTNS * sizeof(btn_map_t));
+    p += (size_t)bc * (size_t)NUM_BTNS * sizeof(btn_map_t);
+
+    *out_buf = buf;
+    *out_len = need;
+    return ESP_OK;
+}
+
+static esp_err_t cfg_v5_unpack(foot_config_t *out, const uint8_t *buf, size_t len)
+{
+    if (!out || !buf) return ESP_ERR_INVALID_ARG;
+    if (len < 1) return ESP_FAIL;
+
+    int bc = (int)buf[0];
+    if (bc < 1 || bc > MAX_BANKS) return ESP_FAIL;
+
+    size_t need = cfg_v5_packed_size(bc);
+    if (len != need) return ESP_FAIL;
+
+    // start from sane defaults (fills unused banks too)
+    set_defaults(out);
+
+    out->bank_count = (uint8_t)bc;
+
+    const uint8_t *p = buf + 1;
+
+    memcpy(out->bank_name, p, (size_t)bc * (size_t)NAME_LEN);
+    p += (size_t)bc * (size_t)NAME_LEN;
+
+    memcpy(out->switch_name, p, (size_t)bc * (size_t)NUM_BTNS * (size_t)NAME_LEN);
+    p += (size_t)bc * (size_t)NUM_BTNS * (size_t)NAME_LEN;
+
+    memcpy(out->map, p, (size_t)bc * (size_t)NUM_BTNS * sizeof(btn_map_t));
+    return ESP_OK;
+}
+
+static esp_err_t nvs_save_v5_packed(const foot_config_t *in)
+{
+    if (!in) return ESP_ERR_INVALID_ARG;
+    if (!s_nvs_ok) return ESP_ERR_INVALID_STATE;
+
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    esp_err_t e = cfg_v5_pack(in, &buf, &len);
+    if (e != ESP_OK) return e;
+
+    cfg_hdr_v4_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.magic = CFG_MAGIC;
+    hdr.ver   = CFG_VER;      // 5
+    hdr.size  = (uint32_t)len;
+
+    nvs_handle_t h;
+    e = nvs_open("footsw", NVS_READWRITE, &h);
+    if (e != ESP_OK) {
+        heap_caps_free(buf);
+        return e;
+    }
+
+    e = nvs_set_blob(h, "cfg_hdr", &hdr, sizeof(hdr));
+    if (e == ESP_OK) e = nvs_set_blob(h, "cfg_data", buf, len);
+    if (e == ESP_OK) e = nvs_commit(h);
+    nvs_close(h);
+
+    heap_caps_free(buf);
+
+    if (e != ESP_OK) ESP_LOGE(TAG, "nvs_save_v5_packed failed: %s", esp_err_to_name(e));
+    return e;
+}
+
+static esp_err_t nvs_load_v5_packed(foot_config_t *out, const cfg_hdr_v4_t *hdr)
+{
+    if (!out || !hdr) return ESP_ERR_INVALID_ARG;
+    if (!s_nvs_ok) return ESP_ERR_INVALID_STATE;
+
+    if (hdr->magic != CFG_MAGIC || hdr->ver != CFG_VER) return ESP_FAIL;
+    if (hdr->size < 1 || hdr->size > (uint32_t)cfg_v5_packed_size(MAX_BANKS)) return ESP_FAIL;
+
+    nvs_handle_t h;
+    esp_err_t e = nvs_open("footsw", NVS_READONLY, &h);
+    if (e != ESP_OK) return e;
+
+    size_t dlen = 0;
+    e = nvs_get_blob(h, "cfg_data", NULL, &dlen);
+    if (e != ESP_OK || dlen != (size_t)hdr->size) {
+        nvs_close(h);
+        return ESP_FAIL;
+    }
+
+    uint8_t *buf = (uint8_t *)heap_caps_malloc(dlen, MALLOC_CAP_8BIT);
+    if (!buf) {
+        nvs_close(h);
+        return ESP_ERR_NO_MEM;
+    }
+
+    e = nvs_get_blob(h, "cfg_data", buf, &dlen);
+    nvs_close(h);
+
+    if (e == ESP_OK) {
+        e = cfg_v5_unpack(out, buf, dlen);
+    }
+
+    heap_caps_free(buf);
+    return e;
+}
+
+static esp_err_t nvs_load_cfg_any(foot_config_t *out)
+{
+    if (!out) return ESP_ERR_INVALID_ARG;
+    if (!s_nvs_ok) return ESP_ERR_INVALID_STATE;
+
+    nvs_handle_t h;
+    esp_err_t e = nvs_open("footsw", NVS_READONLY, &h);
+    if (e != ESP_OK) return e;
+
+    size_t hlen = sizeof(cfg_hdr_v4_t);
+    cfg_hdr_v4_t hdr;
+    e = nvs_get_blob(h, "cfg_hdr", &hdr, &hlen);
+    nvs_close(h);
+    if (e != ESP_OK || hlen != sizeof(cfg_hdr_v4_t)) return ESP_FAIL;
+
+    if (hdr.magic != CFG_MAGIC) return ESP_FAIL;
+
+    if (hdr.ver == CFG_VER) {
+        return nvs_load_v5_packed(out, &hdr);
+    }
+    if (hdr.ver == 4) {
+        // v4 old full-size config
+        return nvs_load_v4(out);
+    }
+    return ESP_FAIL;
+}
+
 
 const foot_config_t *config_store_get(void)
 {
@@ -672,24 +915,48 @@ void config_store_init(void)
     set_defaults(s_cfg);
 
     if (s_nvs_ok) {
-        // v4 first
-        e = nvs_load_v4(s_cfg);
+        // ✅ create mutex + async save task once NVS is available
+        if (!s_cfg_mtx) s_cfg_mtx = xSemaphoreCreateMutex();
+        if (!s_cfg_save_task) {
+            xTaskCreatePinnedToCore(cfg_save_task, "cfg_save", 4096, NULL, 5, &s_cfg_save_task, 0);
+        }
+
+        // peek saved ver (for one-time migrate v4->v5)
+        uint16_t saved_ver = 0;
+        {
+            nvs_handle_t th;
+            if (nvs_open("footsw", NVS_READONLY, &th) == ESP_OK) {
+                size_t hlen = sizeof(cfg_hdr_v4_t);
+                cfg_hdr_v4_t hdr;
+                if (nvs_get_blob(th, "cfg_hdr", &hdr, &hlen) == ESP_OK && hlen == sizeof(cfg_hdr_v4_t)) {
+                    if (hdr.magic == CFG_MAGIC) saved_ver = hdr.ver;
+                }
+                nvs_close(th);
+            }
+        }
+
+        e = nvs_load_cfg_any(s_cfg);
         if (e == ESP_OK) {
-            ESP_LOGI(TAG, "Loaded config v4 from NVS");
+            ESP_LOGI(TAG, "Loaded config ver=%u from NVS", (unsigned)saved_ver);
+
+            // v4 -> migrate to v5 packed (ลดขนาดทันที)
+            if (saved_ver == 4) {
+                ESP_LOGW(TAG, "Migrating config v4 -> v5 packed");
+                (void)nvs_save_v5_packed(s_cfg);
+            }
         } else {
-            // migrate v3 -> v4 (page0)
+            // migrate v3 -> v5 (ผ่าน struct เดิม)
             e = nvs_load_migrate_v3_to_v4(s_cfg);
             if (e == ESP_OK) {
-                ESP_LOGW(TAG, "Migrated legacy v3 -> v4 (page removed, keep page0)");
-                (void)nvs_save_v4(s_cfg);
+                ESP_LOGW(TAG, "Migrated legacy v3 -> v5 packed (page removed, keep page0)");
+                (void)nvs_save_v5_packed(s_cfg);
             } else {
-                ESP_LOGW(TAG, "No saved config (v4/v3), using defaults");
-                (void)nvs_save_v4(s_cfg);
+                ESP_LOGW(TAG, "No saved config, using defaults -> v5 packed");
+                (void)nvs_save_v5_packed(s_cfg);
             }
         }
 
         sanitize_cfg(s_cfg);
-        (void)nvs_save_v4(s_cfg);
 
         // led brightness
         uint8_t bri = 100;
@@ -834,6 +1101,8 @@ esp_err_t config_store_set_layout_json(const char *json)
 
     cJSON_Delete(root);
 
+    cfg_lock();
+
     s_cfg->bank_count = new_bank_count;
     memcpy(s_cfg->bank_name, new_bank_name, sizeof(new_bank_name));
 
@@ -843,9 +1112,16 @@ esp_err_t config_store_set_layout_json(const char *json)
     int cur = (int)s_cur_bank;
     int bc2 = config_store_bank_count();
     s_cur_bank = (uint8_t)wrapi(cur, bc2);
+
+    cfg_unlock();
+
     if (s_nvs_ok) (void)nvs_save_cur_bank(s_cur_bank);
 
-    return nvs_save_v4(s_cfg);
+    // ✅ async save + refresh display slave
+    cfg_request_save();
+    display_uart_request_refresh();
+
+    return ESP_OK;
 }
 
 // ---- bank json (switch names) ----
@@ -900,6 +1176,8 @@ esp_err_t config_store_set_bank_json(int bank, const char *json)
     int n = cJSON_GetArraySize(arr);
     if (n > NUM_BTNS) n = NUM_BTNS;
 
+    cfg_lock();
+
     for (int k = 0; k < n; k++) {
         cJSON *s = cJSON_GetArrayItem(arr, k);
         if (cJSON_IsString(s)) {
@@ -909,8 +1187,14 @@ esp_err_t config_store_set_bank_json(int bank, const char *json)
     }
 
     cJSON_Delete(root);
+
     sanitize_cfg(s_cfg);
-    return nvs_save_v4(s_cfg);
+    cfg_unlock();
+
+    cfg_request_save();
+    display_uart_request_refresh();
+
+    return ESP_OK;
 }
 
 // ---------- JSON helpers (per-button) ----------
@@ -1034,6 +1318,8 @@ esp_err_t config_store_set_btn_json(int bank, int btn, const char *json)
         return ESP_FAIL;
     }
 
+    cfg_lock();
+
     btn_map_t *m = &s_cfg->map[bank][btn];
 
     int pressMode = clampi(pm->valueint, 0, 3);
@@ -1058,6 +1344,7 @@ esp_err_t config_store_set_btn_json(int bank, int btn, const char *json)
     for (int i = 0; i < ns; i++) {
         if (!parse_action(cJSON_GetArrayItem(sa, i), &m->short_actions[i])) {
             cJSON_Delete(root);
+            cfg_unlock();
             return ESP_FAIL;
         }
     }
@@ -1067,16 +1354,20 @@ esp_err_t config_store_set_btn_json(int bank, int btn, const char *json)
     for (int i = 0; i < nl; i++) {
         if (!parse_action(cJSON_GetArrayItem(la, i), &m->long_actions[i])) {
             cJSON_Delete(root);
+            cfg_unlock();
             return ESP_FAIL;
         }
     }
 
     cJSON_Delete(root);
-    sanitize_cfg(s_cfg);
 
-    esp_err_t e = nvs_save_v4(s_cfg);
-    if (e != ESP_OK) return e;
-    (void)nvs_save_ab_led_sel();
+    sanitize_cfg(s_cfg);
+    cfg_unlock();
+
+    // ✅ async save (ลดอาการเว็บค้างตอนเซฟ)
+    cfg_request_save();
+
+    if (s_nvs_ok) (void)nvs_save_ab_led_sel();
     return ESP_OK;
 }
 
@@ -1125,6 +1416,10 @@ esp_err_t config_store_set_current_bank(uint8_t bank)
 {
     int bc = config_store_bank_count();
     s_cur_bank = (uint8_t)wrapi((int)bank, bc);
+
+    // ✅ notify display slave every time bank changes
+    display_uart_request_refresh();
+
     if (!s_nvs_ok) return ESP_ERR_INVALID_STATE;
     return nvs_save_cur_bank(s_cur_bank);
 }
