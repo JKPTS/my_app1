@@ -1,4 +1,4 @@
-// ===== FILE: tft_client_2432s028.ino =====
+// ===== FILE: esp32-2432.ino (tft_client_2432s028) =====
 #include <Arduino.h>
 #include <Preferences.h>
 #include <TFT_eSPI.h>
@@ -6,18 +6,132 @@
 TFT_eSPI tft = TFT_eSPI();
 Preferences prefs;
 
-// ✅ ตามรูป: GPIO1 = TX, GPIO3 = RX
-static const int UART_RX_PIN = 3;   // RX ของบอร์ดจอ
-static const int UART_TX_PIN = 1;   // TX ของบอร์ดจอ
+// UART: ESP32-S3 TX(GPIO21) -> ESP32-2432 RX(GPIO3)
+// ใช้ UART1 (Serial1) RX=GPIO3, TX=GPIO1
+static const int UART_RX_PIN = 3;
+static const int UART_TX_PIN = 1;
 static const uint32_t UART_BAUD = 115200;
 
-static String bankName = "bank";
-static String swName[8] = {"sw1","sw2","sw3","sw4","sw5","sw6","sw7","sw8"};
+// state
+static String bankName = "BANK";
+static String swName[8] = {"SW1","SW2","SW3","SW4","SW5","SW6","SW7","SW8"};
 static int bankIndex = 0;
 
+// line buffer
 static String lineBuf;
 
-// -------------------- NVS (eeprom-like) --------------------
+// debounce NVS save
+static bool nvsDirty = false;
+static uint32_t nvsSaveAtMs = 0;
+static const uint32_t NVS_DEBOUNCE_MS = 800;
+
+// -------------------- helpers --------------------
+static uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
+{
+  return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+}
+
+static String toUpperAscii(const String &in)
+{
+  String out = in;
+  for (size_t i = 0; i < out.length(); i++) {
+    char c = out[i];
+    if (c >= 'a' && c <= 'z') out[i] = (char)(c - 'a' + 'A');
+  }
+  return out;
+}
+
+static String normName(const String &in, const char *fallback)
+{
+  String s = in;
+  s.trim();
+  if (s.length() == 0) return String(fallback);
+  return toUpperAscii(s);
+}
+
+// fit text to width with "..."
+static String fitText(const String &txt, int maxPx, int font)
+{
+  String s = txt;
+  if (s.length() == 0) return s;
+
+  if (tft.textWidth(s, font) <= maxPx) return s;
+
+  const String dots = "...";
+  const int dotsW = tft.textWidth(dots, font);
+
+  while (s.length() > 0 && (tft.textWidth(s, font) + dotsW) > maxPx) {
+    s.remove(s.length() - 1);
+  }
+  if (s.length() == 0) return dots;
+  return s + dots;
+}
+
+// centered label with safe font fallback (4 -> 2)
+static void drawCenteredLabel(int x, int y, int w, int h, const String &label, uint16_t fg, uint16_t bg)
+{
+  const int pad = 10;
+  const int maxPx = w - pad * 2;
+
+  int font = 4;
+  if (tft.textWidth(label, font) > maxPx) font = 2;
+
+  String shown = fitText(label, maxPx, font);
+
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextFont(font);
+  tft.setTextColor(fg, bg);
+  tft.drawString(shown, x + w / 2, y + h / 2);
+}
+
+// minimal card: fill + thin border + accent underline
+static void drawSwitchCard(int x, int y, int w, int h, uint16_t fill, uint16_t border, uint16_t accent, const String &label)
+{
+  tft.fillRoundRect(x, y, w, h, 12, fill);
+  tft.drawRoundRect(x, y, w, h, 12, border);
+
+  // subtle inner border
+  tft.drawRoundRect(x + 1, y + 1, w - 2, h - 2, 11, rgb565(45, 52, 64));
+
+  // accent underline (minimal color)
+  const int lineH = 5;
+  tft.fillRoundRect(x + 10, y + h - 10, w - 20, lineH, 3, accent);
+
+  drawCenteredLabel(x, y, w, h - 2, label, TFT_WHITE, fill);
+}
+
+// bank panel: main highlight + accent border + inner accent line
+static void drawBankPanel(int x, int y, int w, int h, uint16_t fill, uint16_t border, uint16_t accent, const String &label)
+{
+  tft.fillRoundRect(x, y, w, h, 16, fill);
+  tft.drawRoundRect(x, y, w, h, 16, border);
+
+  // accent border line (outer glow style but still minimal)
+  tft.drawRoundRect(x + 1, y + 1, w - 2, h - 2, 15, accent);
+
+  // inner accent line (thin)
+  tft.drawFastHLine(x + 18, y + 12, w - 36, accent);
+  tft.drawFastHLine(x + 18, y + h - 13, w - 36, accent);
+
+  // BANK text: 4 -> 2
+  const int pad = 18;
+  const int maxPx = w - pad * 2;
+  int font = 4;
+  if (tft.textWidth(label, font) > maxPx) font = 2;
+
+  String shown = fitText(label, maxPx, font);
+
+  // slight text shadow (1px) ให้ดูชัดแต่ไม่รก
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextFont(font);
+  tft.setTextColor(rgb565(0, 0, 0), fill);
+  tft.drawString(shown, x + w / 2 + 1, y + h / 2 + 1);
+
+  tft.setTextColor(TFT_WHITE, fill);
+  tft.drawString(shown, x + w / 2, y + h / 2);
+}
+
+// -------------------- NVS --------------------
 static void saveToNVS()
 {
   prefs.begin("disp", false);
@@ -34,10 +148,10 @@ static void loadFromNVS()
 {
   prefs.begin("disp", true);
   bankIndex = prefs.getInt("bank_i", 0);
-  bankName  = prefs.getString("bank_n", "bank");
+  bankName  = prefs.getString("bank_n", "BANK");
   for (int i = 0; i < 8; i++) {
     String key = "sw" + String(i + 1);
-    swName[i] = prefs.getString(key.c_str(), "sw" + String(i + 1));
+    swName[i] = prefs.getString(key.c_str(), "SW" + String(i + 1));
   }
   prefs.end();
 }
@@ -45,46 +159,70 @@ static void loadFromNVS()
 // -------------------- UI --------------------
 static void drawUI()
 {
-  tft.fillScreen(TFT_BLACK);
+  const int W = tft.width();
+  const int H = tft.height();
 
-  tft.setTextFont(2);
-  tft.setTextSize(1);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  // theme colors (balanced minimal + color)
+  const uint16_t BG        = rgb565(12, 15, 20);   // soft dark
+  const uint16_t CARD_BG   = rgb565(22, 27, 35);   // card
+  const uint16_t CARD_BRD  = rgb565(38, 46, 60);   // border
 
-  tft.setCursor(10, 10);
-  tft.printf("bank %d:", bankIndex + 1);
+  const uint16_t ACC_CYAN  = rgb565(70, 220, 255); // top row + bank accent
+  const uint16_t ACC_AMBER = rgb565(255, 185, 90); // bottom row
 
-  tft.setCursor(10, 30);
-  tft.setTextFont(4);
-  tft.setTextColor(TFT_CYAN, TFT_BLACK);
-  tft.print(bankName);
+  const uint16_t BANK_BG   = rgb565(16, 22, 30);
+  const uint16_t BANK_BRD  = rgb565(45, 55, 70);
 
-  tft.setTextFont(2);
-  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.fillScreen(BG);
 
-  int startY = 70;
-  int rowH   = 38;
-  int colW   = 155;
+  // layout (balanced)
+  const int margin = 14;
+  const int gap = 10;
 
-  for (int i = 0; i < 8; i++) {
-    int r = i / 2;
-    int c = i % 2;
+  const int cardW = (W - margin * 2 - gap * 3) / 4;
+  const int cardH = 58;
 
-    int x = 10 + c * colW;
-    int y = startY + r * rowH;
+  const int topY = 18;
+  const int botY = H - 18 - cardH;
 
-    tft.drawRect(x, y, colW - 15, rowH - 6, TFT_DARKGREY);
+  // middle bank area fits naturally between rows
+  const int midTop = topY + cardH;
+  const int midBot = botY;
+  const int midH = midBot - midTop;
 
-    tft.setCursor(x + 6, y + 6);
-    tft.printf("%d:", i + 1);
+  int bankH = 78;
+  int bankW = W - margin * 2;
+  if (midH > 0) {
+    int maxH = midH - 18;
+    if (maxH < 60) maxH = 60;
+    if (bankH > maxH) bankH = maxH;
+  }
+  const int bankX = margin;
+  const int bankY = midTop + (midH - bankH) / 2;
 
-    tft.setCursor(x + 30, y + 6);
-    tft.print(swName[i]);
+  // normalize display text
+  String b = normName(bankName, "BANK");
+  String s[8];
+  for (int i = 0; i < 8; i++) s[i] = normName(swName[i], "");
+
+  // top 4
+  for (int i = 0; i < 4; i++) {
+    int x = margin + i * (cardW + gap);
+    drawSwitchCard(x, topY, cardW, cardH, CARD_BG, CARD_BRD, ACC_CYAN, s[i]);
+  }
+
+  // bank panel (accent cyan)
+  drawBankPanel(bankX, bankY, bankW, bankH, BANK_BG, BANK_BRD, ACC_CYAN, b);
+
+  // bottom 4
+  for (int i = 0; i < 4; i++) {
+    int x = margin + i * (cardW + gap);
+    drawSwitchCard(x, botY, cardW, cardH, CARD_BG, CARD_BRD, ACC_AMBER, s[i + 4]);
   }
 }
 
 // -------------------- protocol --------------------
-// @U,<bank>,<bankname>,<sw1>..,<sw8>
+// from S3: "@U,<bank>,<bankname>,<sw1>,...,<sw8>\r\n"
 static bool parseUpdateLine(const String &line)
 {
   if (!line.startsWith("@U,")) return false;
@@ -102,18 +240,20 @@ static bool parseUpdateLine(const String &line)
     parts[count++] = line.substring(start, idx);
     start = idx + 1;
   }
-  if (count < 11) return false;
+  if (count < 3) return false;
 
-  bankIndex = parts[1].toInt();
+  bankIndex = parts[1].toInt();  // เก็บไว้ แม้ไม่แสดงเลข
   bankName  = parts[2];
   bankName.trim();
-  if (bankName.length() == 0) bankName = "bank";
 
   for (int i = 0; i < 8; i++) {
-    String s = parts[3 + i];
-    s.trim();
-    if (s.length() == 0) s = "sw" + String(i + 1);
-    swName[i] = s;
+    int pi = 3 + i;
+    if (pi < count) {
+      String s = parts[pi];
+      s.trim();
+      if (s.length() > 0) swName[i] = s;
+    }
+    if (swName[i].length() == 0) swName[i] = "SW" + String(i + 1);
   }
 
   return true;
@@ -121,16 +261,20 @@ static bool parseUpdateLine(const String &line)
 
 void setup()
 {
-  // debug ทาง usb ได้ (ถ้าบอร์ดคุณใช้ usb-serial)
   Serial.begin(115200);
+  delay(50);
 
-  // uart คุยกับ S3 (ตามรูป)
   Serial1.begin(UART_BAUD, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
 
   tft.init();
-  tft.setRotation(1);
+  tft.setRotation(1); // landscape
 
   loadFromNVS();
+
+  // normalize uppercase for display
+  bankName = normName(bankName, "BANK");
+  for (int i = 0; i < 8; i++) swName[i] = normName(swName[i], "");
+
   drawUI();
 
   Serial.println("tft client ready ✅");
@@ -150,18 +294,28 @@ void loop()
       if (line.length() == 0) continue;
 
       if (parseUpdateLine(line)) {
-        // ✅ ส่ง ACK ให้ไวที่สุดก่อน กันฝั่ง S3 timeout/หน่วง
-        Serial1.print("@A,SAVED\n");
+        bankName = normName(bankName, "BANK");
+        for (int i = 0; i < 8; i++) swName[i] = normName(swName[i], "");
+
+        // ACK
+        Serial1.print("@A,OK\n");
         Serial1.flush();
 
-        // ค่อยทำงานหนักทีหลัง
-        saveToNVS();
         drawUI();
 
-        Serial.println("saved -> ACK sent ✅");
+        nvsDirty = true;
+        nvsSaveAtMs = millis() + NVS_DEBOUNCE_MS;
+
+        Serial.println("update received ✅");
       }
     } else {
       if (lineBuf.length() < 300) lineBuf += ch;
     }
+  }
+
+  if (nvsDirty && (int32_t)(millis() - nvsSaveAtMs) >= 0) {
+    saveToNVS();
+    nvsDirty = false;
+    Serial.println("saved to NVS ✅");
   }
 }
