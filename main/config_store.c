@@ -15,6 +15,10 @@
 #include "nvs_flash.h"
 #include "cJSON.h"
 #include "esp_heap_caps.h"
+#include "esp_spiffs.h"
+
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "config_store.h"
 #include "display_uart.h"
@@ -32,6 +36,20 @@ static void set_defaults(foot_config_t *cfg);
 
 // ✅ สถานะ NVS (กัน abort/รีบูต)
 static bool s_nvs_ok = false;
+static bool s_spiffs_ok = false;
+
+#define CFG_FILE_PATH     "/spiffs/footsw_cfg_v5.bin"
+#define CFG_FILE_PATH_TMP "/spiffs/footsw_cfg_v5.tmp"
+
+#define CFG_MAGIC 0x46435346u  // 'FSCF'
+#define CFG_VER   5            // v4 = no pages
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint16_t ver;
+    uint16_t reserved;
+    uint32_t size;
+} cfg_hdr_v4_t;
 
 // ---- config persistence (async + coalesce) ----
 static SemaphoreHandle_t s_cfg_mtx = NULL;
@@ -44,7 +62,7 @@ static void cfg_unlock(void) { if (s_cfg_mtx) xSemaphoreGive(s_cfg_mtx); }
 
 static void cfg_request_save(void)
 {
-    if (!s_nvs_ok) return;
+    if (!s_nvs_ok && !s_spiffs_ok) return;
     if (!s_cfg_save_task) return;
 
     s_cfg_dirty = true;
@@ -52,7 +70,16 @@ static void cfg_request_save(void)
     xTaskNotifyGive(s_cfg_save_task);
 }
 
+// forward decl
+static bool cfg_mount_spiffs_noformat(void);
+static esp_err_t cfg_save_v5_packed_file(const foot_config_t *in);
+static esp_err_t cfg_load_v5_packed_file(foot_config_t *out);
 static esp_err_t nvs_save_v5_packed(const foot_config_t *in);
+
+// v5 pack/unpack helpers (defined later)
+static size_t cfg_v5_packed_size(int bank_count);
+static esp_err_t cfg_v5_pack(const foot_config_t *in, uint8_t **out_buf, size_t *out_len);
+static esp_err_t cfg_v5_unpack(foot_config_t *out, const uint8_t *buf, size_t len);
 
 static void cfg_save_task(void *arg)
 {
@@ -84,7 +111,15 @@ static void cfg_save_task(void *arg)
         last_seq = s_cfg_seq;
         cfg_unlock();
 
-        esp_err_t e = nvs_save_v5_packed(snap);
+        // Prefer SPIFFS (supports MAX_BANKS without NVS double-space problem)
+        esp_err_t e = ESP_FAIL;
+        if (cfg_mount_spiffs_noformat()) {
+            e = cfg_save_v5_packed_file(snap);
+        }
+        // fallback to NVS (may fail when config is very large)
+        if (e != ESP_OK) {
+            e = nvs_save_v5_packed(snap);
+        }
         heap_caps_free(snap);
 
         if (e == ESP_OK) {
@@ -95,6 +130,116 @@ static void cfg_save_task(void *arg)
             // keep dirty; next notify will retry
         }
     }
+}
+
+// ---------- SPIFFS mount (non-format) ----------
+static bool cfg_mount_spiffs_noformat(void)
+{
+    if (s_spiffs_ok) return true;
+
+    esp_vfs_spiffs_conf_t conf = {
+        .base_path = "/spiffs",
+        .partition_label = NULL,
+        .max_files = 8,
+        .format_if_mount_failed = false, // IMPORTANT: do not wipe web files
+    };
+
+    esp_err_t e = esp_vfs_spiffs_register(&conf);
+    if (e == ESP_ERR_INVALID_STATE) {
+        // already registered (e.g., portal_wifi)
+        s_spiffs_ok = true;
+        return true;
+    }
+    if (e != ESP_OK) {
+        ESP_LOGW(TAG, "SPIFFS mount (noformat) failed: %s", esp_err_to_name(e));
+        s_spiffs_ok = false;
+        return false;
+    }
+
+    s_spiffs_ok = true;
+    return true;
+}
+
+// ---------- SPIFFS config save/load (v5 packed) ----------
+static esp_err_t cfg_save_v5_packed_file(const foot_config_t *in)
+{
+    if (!in) return ESP_ERR_INVALID_ARG;
+    if (!cfg_mount_spiffs_noformat()) return ESP_ERR_INVALID_STATE;
+
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    esp_err_t e = cfg_v5_pack(in, &buf, &len);
+    if (e != ESP_OK) return e;
+
+    cfg_hdr_v4_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.magic = CFG_MAGIC;
+    hdr.ver   = CFG_VER;      // 5
+    hdr.size  = (uint32_t)len;
+
+    FILE *f = fopen(CFG_FILE_PATH_TMP, "wb");
+    if (!f) {
+        heap_caps_free(buf);
+        return ESP_FAIL;
+    }
+
+    size_t w1 = fwrite(&hdr, 1, sizeof(hdr), f);
+    size_t w2 = fwrite(buf, 1, len, f);
+    fflush(f);
+    fclose(f);
+
+    heap_caps_free(buf);
+
+    if (w1 != sizeof(hdr) || w2 != len) {
+        unlink(CFG_FILE_PATH_TMP);
+        return ESP_FAIL;
+    }
+
+    // atomic replace
+    unlink(CFG_FILE_PATH);
+    if (rename(CFG_FILE_PATH_TMP, CFG_FILE_PATH) != 0) {
+        unlink(CFG_FILE_PATH_TMP);
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t cfg_load_v5_packed_file(foot_config_t *out)
+{
+    if (!out) return ESP_ERR_INVALID_ARG;
+    if (!cfg_mount_spiffs_noformat()) return ESP_ERR_INVALID_STATE;
+
+    FILE *f = fopen(CFG_FILE_PATH, "rb");
+    if (!f) return ESP_ERR_NOT_FOUND;
+
+    cfg_hdr_v4_t hdr;
+    size_t r1 = fread(&hdr, 1, sizeof(hdr), f);
+    if (r1 != sizeof(hdr) || hdr.magic != CFG_MAGIC || hdr.ver != CFG_VER) {
+        fclose(f);
+        return ESP_FAIL;
+    }
+    if (hdr.size < 1 || hdr.size > (uint32_t)cfg_v5_packed_size(MAX_BANKS)) {
+        fclose(f);
+        return ESP_FAIL;
+    }
+
+    size_t dlen = (size_t)hdr.size;
+    uint8_t *buf = (uint8_t *)heap_caps_malloc(dlen, MALLOC_CAP_8BIT);
+    if (!buf) {
+        fclose(f);
+        return ESP_ERR_NO_MEM;
+    }
+    size_t r2 = fread(buf, 1, dlen, f);
+    fclose(f);
+
+    if (r2 != dlen) {
+        heap_caps_free(buf);
+        return ESP_FAIL;
+    }
+
+    esp_err_t e = cfg_v5_unpack(out, buf, dlen);
+    heap_caps_free(buf);
+    return e;
 }
 
 
@@ -111,16 +256,6 @@ static uint8_t s_cur_bank = 0;
 
 // ---- exp/fs stored separately (blob) ----
 static expfs_port_cfg_t s_expfs[EXPFS_PORT_COUNT];
-
-#define CFG_MAGIC 0x46435346u  // 'FSCF'
-#define CFG_VER   5            // v4 = no pages
-
-typedef struct __attribute__((packed)) {
-    uint32_t magic;
-    uint16_t ver;
-    uint16_t reserved;
-    uint32_t size;
-} cfg_hdr_v4_t;
 
 // ---------- legacy structures (v3 had pages) ----------
 #define LEGACY_V3_MAX_BANKS 20
@@ -911,16 +1046,33 @@ void config_store_init(void)
         ESP_LOGE(TAG, "NVS not available: %s (run with defaults, no persistence)", esp_err_to_name(e));
     }
 
-    // defaults
+    // defaults (used when no stored config)
     set_defaults(s_cfg);
 
-    if (s_nvs_ok) {
-        // ✅ create mutex + async save task once NVS is available
+    // SPIFFS (no-format) — used for large config persistence
+    (void)cfg_mount_spiffs_noformat();
+
+    // ✅ create mutex + async save task once *any* persistence is available
+    if (s_nvs_ok || s_spiffs_ok) {
         if (!s_cfg_mtx) s_cfg_mtx = xSemaphoreCreateMutex();
         if (!s_cfg_save_task) {
             xTaskCreatePinnedToCore(cfg_save_task, "cfg_save", 4096, NULL, 5, &s_cfg_save_task, 0);
         }
+    }
 
+    bool loaded_cfg = false;
+
+    // 1) prefer SPIFFS config (works even at MAX_BANKS)
+    if (s_spiffs_ok) {
+        esp_err_t fe = cfg_load_v5_packed_file(s_cfg);
+        if (fe == ESP_OK) {
+            loaded_cfg = true;
+            ESP_LOGI(TAG, "Loaded config ver=%u from SPIFFS", (unsigned)CFG_VER);
+        }
+    }
+
+    // 2) fallback to NVS (legacy) and then cache to SPIFFS
+    if (!loaded_cfg && s_nvs_ok) {
         // peek saved ver (for one-time migrate v4->v5)
         uint16_t saved_ver = 0;
         {
@@ -937,9 +1089,8 @@ void config_store_init(void)
 
         e = nvs_load_cfg_any(s_cfg);
         if (e == ESP_OK) {
+            loaded_cfg = true;
             ESP_LOGI(TAG, "Loaded config ver=%u from NVS", (unsigned)saved_ver);
-
-            // v4 -> migrate to v5 packed (ลดขนาดทันที)
             if (saved_ver == 4) {
                 ESP_LOGW(TAG, "Migrating config v4 -> v5 packed");
                 (void)nvs_save_v5_packed(s_cfg);
@@ -948,16 +1099,24 @@ void config_store_init(void)
             // migrate v3 -> v5 (ผ่าน struct เดิม)
             e = nvs_load_migrate_v3_to_v4(s_cfg);
             if (e == ESP_OK) {
+                loaded_cfg = true;
                 ESP_LOGW(TAG, "Migrated legacy v3 -> v5 packed (page removed, keep page0)");
-                (void)nvs_save_v5_packed(s_cfg);
-            } else {
-                ESP_LOGW(TAG, "No saved config, using defaults -> v5 packed");
                 (void)nvs_save_v5_packed(s_cfg);
             }
         }
 
-        sanitize_cfg(s_cfg);
+        if (!loaded_cfg) {
+            ESP_LOGW(TAG, "No saved config, using defaults");
+            (void)nvs_save_v5_packed(s_cfg);
+        }
 
+        // cache to SPIFFS for future (so MAX_BANKS saves work)
+        if (s_spiffs_ok) (void)cfg_save_v5_packed_file(s_cfg);
+    }
+
+    sanitize_cfg(s_cfg);
+
+    if (s_nvs_ok) {
         // led brightness
         uint8_t bri = 100;
         e = nvs_load_led_brightness(&bri);
@@ -1614,4 +1773,151 @@ esp_err_t config_store_set_expfs_cal(int port, int which_min0_max1, uint16_t raw
     expfs_sanitize_all();
     if (s_nvs_ok) return nvs_save_expfs();
     return ESP_ERR_INVALID_STATE;
+}
+
+// -------------------- import/export (generator + packed) --------------------
+static uint32_t rng_u32(uint32_t *s)
+{
+    // simple LCG (good enough for deterministic filler)
+    *s = (*s * 1664525u) + 1013904223u;
+    return *s;
+}
+
+static uint8_t rng_range_u8(uint32_t *s, uint8_t lo, uint8_t hi)
+{
+    if (hi <= lo) return lo;
+    uint32_t r = rng_u32(s);
+    return (uint8_t)(lo + (r % (uint32_t)(hi - lo + 1u)));
+}
+
+static void fill_action_list(uint32_t *seed, action_t *list)
+{
+    for (int i = 0; i < MAX_ACTIONS; i++) {
+        action_t a = {0};
+        // alternate CC/PC, but also mix channels and values
+        bool is_cc = ((i & 1) == 0);
+        a.type = is_cc ? ACT_CC : ACT_PC;
+        a.ch   = rng_range_u8(seed, 1, 16);
+        if (is_cc) {
+            a.a = rng_range_u8(seed, 0, 127);   // cc#
+            a.b = rng_range_u8(seed, 0, 127);   // val1
+            a.c = rng_range_u8(seed, 0, 127);   // val2
+        } else {
+            a.a = rng_range_u8(seed, 0, 127);   // program
+            a.b = rng_range_u8(seed, 0, 127);   // (used by exp pc range; harmless here)
+            a.c = 0;
+        }
+        list[i] = a;
+    }
+}
+
+static void config_store_fill_fullmax(uint32_t seed)
+{
+    cfg_lock();
+
+    set_defaults(s_cfg);
+    s_cfg->bank_count = MAX_BANKS;
+
+    // names
+    for (int b = 0; b < MAX_BANKS; b++) {
+        snprintf(s_cfg->bank_name[b], NAME_LEN, "BANK%03d", b + 1);
+        for (int k = 0; k < NUM_BTNS; k++) {
+            // max 5 chars recommended on UI, but config supports NAME_LEN
+            snprintf(s_cfg->switch_name[b][k], NAME_LEN, "SW%u", (unsigned)(k + 1));
+        }
+    }
+
+    // mappings
+    uint32_t s = seed ? seed : 1u;
+    for (int b = 0; b < MAX_BANKS; b++) {
+        for (int k = 0; k < NUM_BTNS; k++) {
+            btn_map_t *m = &s_cfg->map[b][k];
+            // cycle press modes (0..3) and cc behaviors (0..2)
+            m->press_mode = (btn_press_mode_t)((b + k) % 4);
+            m->cc_behavior = (cc_behavior_t)((b + (k * 3)) % 3);
+
+            fill_action_list(&s, m->short_actions);
+            fill_action_list(&s, m->long_actions);
+        }
+    }
+
+    sanitize_cfg(s_cfg);
+    cfg_unlock();
+
+    cfg_request_save();
+}
+
+esp_err_t config_store_import_json(const char *json)
+{
+    if (!json) return ESP_ERR_INVALID_ARG;
+
+    cJSON *root = cJSON_Parse(json);
+    if (!root) return ESP_FAIL;
+
+    cJSON *jgen = cJSON_GetObjectItem(root, "gen");
+    cJSON *jseed = cJSON_GetObjectItem(root, "seed");
+
+    if (cJSON_IsString(jgen) && jgen->valuestring && strcmp(jgen->valuestring, "fullmax") == 0) {
+        uint32_t seed = 1u;
+        if (cJSON_IsNumber(jseed)) {
+            int64_t v = (int64_t)jseed->valuedouble;
+            if (v < 0) v = -v;
+            seed = (uint32_t)(v ? (uint64_t)v : 1u);
+        }
+        cJSON_Delete(root);
+        config_store_fill_fullmax(seed);
+        return ESP_OK;
+    }
+
+    cJSON_Delete(root);
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t config_store_export_packed(uint8_t **out, size_t *out_len)
+{
+    if (!out || !out_len) return ESP_ERR_INVALID_ARG;
+    *out = NULL;
+    *out_len = 0;
+
+    // prefer exporting the exact stored file if available
+    if (cfg_mount_spiffs_noformat()) {
+        struct stat st;
+        if (stat(CFG_FILE_PATH, &st) == 0 && st.st_size > (off_t)sizeof(cfg_hdr_v4_t)) {
+            size_t n = (size_t)st.st_size;
+            uint8_t *buf = (uint8_t *)heap_caps_malloc(n, MALLOC_CAP_8BIT);
+            if (!buf) return ESP_ERR_NO_MEM;
+            FILE *f = fopen(CFG_FILE_PATH, "rb");
+            if (!f) { heap_caps_free(buf); return ESP_FAIL; }
+            size_t r = fread(buf, 1, n, f);
+            fclose(f);
+            if (r != n) { heap_caps_free(buf); return ESP_FAIL; }
+            *out = buf;
+            *out_len = n;
+            return ESP_OK;
+        }
+    }
+
+    // fallback: pack current config into same file format (hdr + data)
+    uint8_t *p = NULL;
+    size_t plen = 0;
+    esp_err_t e = cfg_v5_pack(s_cfg, &p, &plen);
+    if (e != ESP_OK) return e;
+
+    size_t total = sizeof(cfg_hdr_v4_t) + plen;
+    uint8_t *buf = (uint8_t *)heap_caps_malloc(total, MALLOC_CAP_8BIT);
+    if (!buf) { heap_caps_free(p); return ESP_ERR_NO_MEM; }
+
+    cfg_hdr_v4_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.magic = CFG_MAGIC;
+    hdr.ver = CFG_VER;
+    hdr.size = (uint32_t)plen;
+
+    memcpy(buf, &hdr, sizeof(hdr));
+    memcpy(buf + sizeof(hdr), p, plen);
+    heap_caps_free(p);
+
+    *out = buf;
+    *out_len = total;
+    return ESP_OK;
 }

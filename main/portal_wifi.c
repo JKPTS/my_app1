@@ -13,6 +13,10 @@
 #include "esp_netif.h"
 #include "esp_http_server.h"
 #include "esp_spiffs.h"
+#include "esp_app_desc.h"
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
+#include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "esp_system.h"
 
@@ -102,6 +106,154 @@ static esp_err_t send_spiffs_file(httpd_req_t *req, const char *path, const char
 static esp_err_t h_root(httpd_req_t *req) { return send_spiffs_file(req, "/spiffs/index.html", "text/html"); }
 static esp_err_t h_js(httpd_req_t *req)   { return send_spiffs_file(req, "/spiffs/app.js", "application/javascript"); }
 static esp_err_t h_css(httpd_req_t *req)  { return send_spiffs_file(req, "/spiffs/style.css", "text/css"); }
+
+// ---------------- firmware info/update ----------------
+static void restart_later_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(800));
+    esp_restart();
+}
+
+static esp_err_t h_get_fwinfo(httpd_req_t *req)
+{
+    const esp_app_desc_t *ad = esp_app_get_description();
+    char out[384];
+    snprintf(out, sizeof(out),
+             "{\"name\":\"%s\",\"ver\":\"%s\",\"idf\":\"%s\",\"date\":\"%s\",\"time\":\"%s\"}",
+             ad ? ad->project_name : "app",
+             ad ? ad->version : "?",
+             ad ? ad->idf_ver : "?",
+             ad ? ad->date : "?",
+             ad ? ad->time : "?");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, out);
+    return ESP_OK;
+}
+
+static esp_err_t h_post_fwupdate(httpd_req_t *req)
+{
+    // expects raw .bin stream (Content-Type: application/octet-stream)
+    const esp_partition_t *update = esp_ota_get_next_update_partition(NULL);
+    if (!update) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no ota partition");
+        return ESP_FAIL;
+    }
+
+    esp_ota_handle_t ota = 0;
+    esp_err_t e = esp_ota_begin(update, OTA_SIZE_UNKNOWN, &ota);
+    if (e != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ota begin failed");
+        return ESP_FAIL;
+    }
+
+    // small recv buffer (stack) to avoid using the portal shared buffer
+    uint8_t buf[1024];
+    int remaining = req->content_len;
+    while (remaining > 0) {
+        int to_read = remaining;
+        if (to_read > (int)sizeof(buf)) to_read = (int)sizeof(buf);
+        int r = httpd_req_recv(req, (char*)buf, to_read);
+        if (r <= 0) {
+            esp_ota_abort(ota);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "recv fail");
+            return ESP_FAIL;
+        }
+        e = esp_ota_write(ota, buf, r);
+        if (e != ESP_OK) {
+            esp_ota_abort(ota);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ota write failed");
+            return ESP_FAIL;
+        }
+        remaining -= r;
+    }
+
+    e = esp_ota_end(ota);
+    if (e != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ota end failed");
+        return ESP_FAIL;
+    }
+
+    e = esp_ota_set_boot_partition(update);
+    if (e != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "set boot failed");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true,\"reboot\":true}");
+
+    // reboot after response flush
+    xTaskCreate(restart_later_task, "restart_later", 2048, NULL, 5, NULL);
+    return ESP_OK;
+}
+
+// ---------------- config import/export (generator) ----------------
+static esp_err_t h_post_import(httpd_req_t *req)
+{
+    if (!s_buf) return resp_503(req, "buffer not ready");
+
+    int total = req->content_len;
+    if (total <= 0 || total > BUF_MAX) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad body");
+        return ESP_FAIL;
+    }
+
+    if (s_buf_lock) xSemaphoreTake(s_buf_lock, portMAX_DELAY);
+    int got = 0;
+    while (got < total) {
+        int r = httpd_req_recv(req, s_buf + got, total - got);
+        if (r <= 0) {
+            if (s_buf_lock) xSemaphoreGive(s_buf_lock);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "recv fail");
+            return ESP_FAIL;
+        }
+        got += r;
+    }
+    s_buf[total] = 0;
+
+    esp_err_t e = config_store_import_json(s_buf);
+    if (s_buf_lock) xSemaphoreGive(s_buf_lock);
+
+    if (e != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "import not supported");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+static esp_err_t h_get_export(httpd_req_t *req)
+{
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    esp_err_t e = config_store_export_packed(&buf, &len);
+    if (e != ESP_OK || !buf || len == 0) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "export failed");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/octet-stream");
+    httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=footsw_cfg_v5.bin");
+
+    const size_t CH = 1024;
+    size_t off = 0;
+    while (off < len) {
+        size_t n = len - off;
+        if (n > CH) n = CH;
+        if (httpd_resp_send_chunk(req, (const char*)buf + off, n) != ESP_OK) {
+            heap_caps_free(buf);
+            httpd_resp_sendstr_chunk(req, NULL);
+            return ESP_FAIL;
+        }
+        off += n;
+    }
+    heap_caps_free(buf);
+    httpd_resp_sendstr_chunk(req, NULL);
+    return ESP_OK;
+}
 
 // -------- Captive portal detection endpoints (redirect to /) --------
 static esp_err_t h_redirect_to_root(httpd_req_t *req)
@@ -639,6 +791,14 @@ static void start_http_server(void)
     httpd_uri_t u_js   = { .uri="/app.js", .method=HTTP_GET, .handler=h_js };
     httpd_uri_t u_css  = { .uri="/style.css", .method=HTTP_GET, .handler=h_css };
 
+    // firmware update
+    httpd_uri_t u_fwinfo = { .uri="/api/fwinfo", .method=HTTP_GET,  .handler=h_get_fwinfo };
+    httpd_uri_t u_fwupd  = { .uri="/api/fwupdate", .method=HTTP_POST, .handler=h_post_fwupdate };
+
+    // config import/export
+    httpd_uri_t u_import = { .uri="/api/import", .method=HTTP_POST, .handler=h_post_import };
+    httpd_uri_t u_export = { .uri="/api/export", .method=HTTP_GET,  .handler=h_get_export };
+
     httpd_uri_t u_204  = { .uri="/generate_204", .method=HTTP_GET, .handler=h_generate_204 };
     httpd_uri_t u_hot  = { .uri="/hotspot-detect.html", .method=HTTP_GET, .handler=h_hotspot };
     httpd_uri_t u_ncsi = { .uri="/ncsi.txt", .method=HTTP_GET, .handler=h_ncsi };
@@ -667,6 +827,11 @@ static void start_http_server(void)
     reg_uri(s_http, &u_root,  "root");
     reg_uri(s_http, &u_js,    "js");
     reg_uri(s_http, &u_css,   "css");
+
+    reg_uri(s_http, &u_fwinfo, "fwinfo");
+    reg_uri(s_http, &u_fwupd,  "fwupdate");
+    reg_uri(s_http, &u_import, "import");
+    reg_uri(s_http, &u_export, "export");
 
     reg_uri(s_http, &u_204,   "generate_204");
     reg_uri(s_http, &u_hot,   "hotspot");

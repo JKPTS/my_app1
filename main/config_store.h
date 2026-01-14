@@ -135,3 +135,14 @@ esp_err_t config_store_set_expfs_json(int port, const char *json);
 
 // calibration save helper (persist)
 esp_err_t config_store_set_expfs_cal(int port, int which_min0_max1, uint16_t raw);
+
+// ---- import/export helpers ----
+// ✅ generator import:
+//   {"gen":"fullmax","seed":123}
+// - creates MAX_BANKS and fills every slot to MAX_ACTIONS
+esp_err_t config_store_import_json(const char *json);
+
+// export packed config (v5) currently stored; useful for backup/restore
+// - returns ESP_ERR_NOT_FOUND if no stored config file
+// - out will be set to malloc'ed buffer (heap_caps_malloc) that caller must free
+esp_err_t config_store_export_packed(uint8_t **out, size_t *out_len);

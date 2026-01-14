@@ -1,7 +1,14 @@
-# ===== FILE: C:\esp\my_host_project\my_app\partitions.csv =====
 # Name,   Type, SubType, Offset,   Size,     Flags
-phy_init, data, phy,     0xF000,   4K,
-factory,  app,  factory, 0x10000,  3M,
-nvs,      data, nvs,     0x310000, 512K,
-storage,  data, spiffs,  0x390000, 0xC50000,
+
+# --- system (keep below app start 0x10000) ---
+otadata,  data, ota,     0xD000,   0x2000,
+phy_init, data, phy,     0xF000,   0x1000,
+
+# --- OTA apps (3MB each) ---
+ota_0,    app,  ota_0,   0x10000,  0x300000,
+ota_1,    app,  ota_1,   0x310000, 0x300000,
+
+# --- data ---
+nvs,      data, nvs,     0x610000, 0x80000,
+storage,  data, spiffs,  0x690000, 0x950000,
 coredump, data, coredump,0xFE0000, 0x20000,

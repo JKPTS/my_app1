@@ -95,6 +95,104 @@ async function apiPost(url, obj) {
   return r.json();
 }
 
+// ---------- firmware + import/export helpers ----------
+async function loadFwInfo() {
+  const el = $("fwInfo");
+  if (!el) return;
+  try {
+    const info = await apiGet("/api/fwinfo");
+    el.textContent = `${info.name} v${info.ver} | idf ${info.idf} | ${info.date} ${info.time}`;
+  } catch (e) {
+    el.textContent = "unavailable";
+  }
+}
+
+function setupImportExport() {
+  const bExp = $("btnExport");
+  const bImp = $("btnImport");
+  const fImp = $("fileImport");
+  if (bExp) {
+    bExp.addEventListener("click", () => {
+      const a = document.createElement("a");
+      a.href = "/api/export";
+      a.download = "footsw_cfg_v5.bin";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    });
+  }
+  if (bImp && fImp) {
+    bImp.addEventListener("click", () => fImp.click());
+    fImp.addEventListener("change", async () => {
+      const file = fImp.files && fImp.files[0];
+      if (!file) return;
+      try {
+        const txt = await file.text();
+        setMsg("importing… ⚙️");
+        const res = await fetch("/api/import", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: txt,
+        });
+        if (!res.ok) throw new Error(await res.text());
+        setMsg("import ok — reboot not required ✅");
+        // refresh UI state
+        await loadMeta();
+        await loadLayout();
+        await gotoBank(cur.bank);
+      } catch (e) {
+        setMsg("import failed: " + e.message, false);
+      } finally {
+        fImp.value = "";
+      }
+    });
+  }
+}
+
+function setupFirmwareUpdate() {
+  const b = $("fwUpload");
+  const f = $("fwFile");
+  const st = $("fwStatus");
+  const pr = $("fwProg");
+  if (!b || !f) return;
+
+  b.addEventListener("click", () => {
+    const file = f.files && f.files[0];
+    if (!file) {
+      if (st) st.textContent = "select a .bin first";
+      return;
+    }
+
+    if (pr) pr.value = 0;
+    if (st) st.textContent = "uploading…";
+    b.disabled = true;
+
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", "/api/fwupdate", true);
+    xhr.setRequestHeader("Content-Type", "application/octet-stream");
+
+    xhr.upload.onprogress = (ev) => {
+      if (pr && ev.lengthComputable) {
+        pr.value = Math.round((ev.loaded / ev.total) * 100);
+      }
+    };
+    xhr.onerror = () => {
+      if (st) st.textContent = "upload failed";
+      b.disabled = false;
+    };
+    xhr.onload = () => {
+      b.disabled = false;
+      if (xhr.status >= 200 && xhr.status < 300) {
+        if (st) st.textContent = "uploaded ✅ rebooting…";
+      } else {
+        if (st) st.textContent = "upload failed: " + xhr.responseText;
+      }
+    };
+
+    xhr.send(file);
+  });
+}
+
 
 async function apiGetExpfs(port) {
   return apiGet(`/api/expfs?port=${port}`);
@@ -1514,6 +1612,11 @@ function setupUI() {
       setMsg("save failed: " + e.message, false);
     }
   };
+
+  // import/export + firmware UI (if present)
+  setupImportExport();
+  setupFirmwareUpdate();
+  loadFwInfo();
 }
 
 window.addEventListener("load", async () => {

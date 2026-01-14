@@ -309,7 +309,9 @@ static void handle_exp_port(int port, const expfs_port_cfg_t *cfg)
     gpio_set_level(HW[port].tip, 1);
 
     gpio_set_direction(HW[port].ring, GPIO_MODE_INPUT);
-    gpio_set_pull_mode(HW[port].ring, GPIO_FLOATING);
+    // ✅ avoid floating ADC when jack is unplugged (reduces random noise / phantom movement)
+    // internal pulldown is weak (~tens of kΩ) so it won't heavily load typical EXP pedals
+    gpio_set_pull_mode(HW[port].ring, GPIO_PULLDOWN_ONLY);
 
     int raw_i = 0;
     if (adc_read_raw_port(port, &raw_i)) {

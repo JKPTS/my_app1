@@ -41,9 +41,12 @@
       <button id="tabMain" class="btn2 active" type="button">main</button>
       <button id="tabExp1" class="btn2" type="button">exp/fs 1</button>
       <button id="tabExp2" class="btn2" type="button">exp/fs 2</button>
+      <button id="tabFw" class="btn2" type="button">firmware</button>
 
       <div style="margin-left:auto; display:flex; gap:10px; flex-wrap:wrap;">
-        <!-- removed: manual reload buttons (use normal browser refresh if needed) -->
+        <button id="btnExport" class="btn2" type="button">export</button>
+        <input id="fileImport" type="file" accept="application/json" style="display:none" />
+        <button id="btnImport" class="btn2" type="button">import</button>
       </div>
     </div>
 
@@ -193,6 +196,41 @@
       </div>
     </div>
 
+    <!-- FIRMWARE pane -->
+    <div id="paneFw" class="tabPane">
+      <div class="grid expGrid">
+        <section class="card">
+          <div class="cardHead">
+            <div class="cardTitle">firmware update</div>
+          </div>
+
+          <div class="form3" style="padding:12px;">
+            <div class="field">
+              <label>current</label>
+              <div id="fwInfo" class="hint">loading...</div>
+            </div>
+
+            <div class="field">
+              <label for="fwFile">select .bin</label>
+              <input id="fwFile" type="file" accept=".bin,application/octet-stream" />
+            </div>
+
+            <div class="field">
+              <button id="fwUpload" class="btn2" type="button">upload & reboot</button>
+              <div id="fwStatus" class="hint" style="margin-top:8px;"></div>
+            </div>
+
+            <div class="field">
+              <label>progress</label>
+              <progress id="fwProg" value="0" max="100" style="width:100%; height:14px;"></progress>
+            </div>
+
+            <div class="hint">note: upload raw ESP-IDF app .bin (same target/partition). device will reboot automatically.</div>
+          </div>
+        </section>
+      </div>
+    </div>
+
     <!-- staging container app.js uses (hidden) -->
     <div id="expfsWrap"></div>
 
@@ -204,19 +242,23 @@
       const bMain = document.getElementById('tabMain');
       const b1 = document.getElementById('tabExp1');
       const b2 = document.getElementById('tabExp2');
+      const bFw = document.getElementById('tabFw');
       const pMain = document.getElementById('paneMain');
       const p1 = document.getElementById('paneExp1');
       const p2 = document.getElementById('paneExp2');
+      const pFw = document.getElementById('paneFw');
       const key = 'ui_nav_tab';
 
       function setActive(which){
         bMain.classList.toggle('active', which==='main');
         b1.classList.toggle('active', which==='exp1');
         b2.classList.toggle('active', which==='exp2');
+        bFw.classList.toggle('active', which==='fw');
 
         pMain.classList.toggle('active', which==='main');
         p1.classList.toggle('active', which==='exp1');
         p2.classList.toggle('active', which==='exp2');
+        pFw.classList.toggle('active', which==='fw');
 
         try{ localStorage.setItem(key, which); }catch(e){}
       }
@@ -224,6 +266,7 @@
       bMain.addEventListener('click', ()=>setActive('main'));
       b1.addEventListener('click', ()=>setActive('exp1'));
       b2.addEventListener('click', ()=>setActive('exp2'));
+      bFw.addEventListener('click', ()=>setActive('fw'));
 
       let initial = 'main';
       try{ initial = localStorage.getItem(key) || 'main'; }catch(e){}
