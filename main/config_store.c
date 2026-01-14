@@ -14,6 +14,7 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "cJSON.h"
+#include "mbedtls/base64.h"
 #include "esp_heap_caps.h"
 #include "esp_spiffs.h"
 
@@ -1854,9 +1855,9 @@ esp_err_t config_store_import_json(const char *json)
     cJSON *root = cJSON_Parse(json);
     if (!root) return ESP_FAIL;
 
-    cJSON *jgen = cJSON_GetObjectItem(root, "gen");
+    // --- generator mode ---
+    cJSON *jgen  = cJSON_GetObjectItem(root, "gen");
     cJSON *jseed = cJSON_GetObjectItem(root, "seed");
-
     if (cJSON_IsString(jgen) && jgen->valuestring && strcmp(jgen->valuestring, "fullmax") == 0) {
         uint32_t seed = 1u;
         if (cJSON_IsNumber(jseed)) {
@@ -1865,12 +1866,96 @@ esp_err_t config_store_import_json(const char *json)
             seed = (uint32_t)(v ? (uint64_t)v : 1u);
         }
         cJSON_Delete(root);
+
+        // fill + sanitize + persist
+        cfg_lock();
         config_store_fill_fullmax(seed);
-        return ESP_OK;
+        sanitize_cfg(s_cfg);
+        cfg_unlock();
+
+        // persist now (prefer SPIFFS, fallback NVS)
+        esp_err_t e = ESP_FAIL;
+        if (s_spiffs_ok) e = cfg_save_v5_packed_file(s_cfg);
+        if (e != ESP_OK && s_nvs_ok) e = nvs_save_v5_packed(s_cfg);
+        return (e == ESP_OK) ? ESP_OK : e;
     }
 
+    // --- packed-base64 import ---
+    cJSON *jfmt  = cJSON_GetObjectItem(root, "format");
+    cJSON *jdata = cJSON_GetObjectItem(root, "data");
+
+    if (!cJSON_IsString(jfmt) || !jfmt->valuestring || strcmp(jfmt->valuestring, "packed-base64") != 0 ||
+        !cJSON_IsString(jdata) || !jdata->valuestring) {
+        cJSON_Delete(root);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    const char *b64 = jdata->valuestring;
+    size_t b64_len = strlen(b64);
+
+    // decode size upper-bound
+    size_t dec_need = (b64_len / 4) * 3 + 4;
+    uint8_t *dec = (uint8_t *)heap_caps_malloc(dec_need, MALLOC_CAP_8BIT);
+    if (!dec) {
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+
+    size_t dec_len = 0;
+    int rc = mbedtls_base64_decode(dec, dec_need, &dec_len, (const unsigned char *)b64, b64_len);
     cJSON_Delete(root);
-    return ESP_ERR_NOT_SUPPORTED;
+
+    if (rc != 0 || dec_len < sizeof(cfg_hdr_v4_t) + 1) {
+        heap_caps_free(dec);
+        return ESP_FAIL;
+    }
+
+    // validate header
+    cfg_hdr_v4_t hdr;
+    memcpy(&hdr, dec, sizeof(hdr));
+    if (hdr.magic != CFG_MAGIC || hdr.ver != CFG_VER) {
+        heap_caps_free(dec);
+        return ESP_FAIL;
+    }
+
+    size_t need_total = sizeof(cfg_hdr_v4_t) + (size_t)hdr.size;
+    if (hdr.size < 1 || need_total != dec_len) {
+        heap_caps_free(dec);
+        return ESP_FAIL;
+    }
+
+    // unpack into temp config
+    foot_config_t *tmp = (foot_config_t *)heap_caps_malloc(sizeof(foot_config_t), MALLOC_CAP_8BIT);
+    if (!tmp) {
+        heap_caps_free(dec);
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_err_t e = cfg_v5_unpack(tmp, dec + sizeof(cfg_hdr_v4_t), (size_t)hdr.size);
+    heap_caps_free(dec);
+
+    if (e != ESP_OK) {
+        heap_caps_free(tmp);
+        return e;
+    }
+
+    sanitize_cfg(tmp);
+
+    // swap into live config
+    cfg_lock();
+    memcpy(s_cfg, tmp, sizeof(*s_cfg));
+    cfg_unlock();
+    heap_caps_free(tmp);
+
+    // persist now (write config file)
+    e = ESP_FAIL;
+    if (s_spiffs_ok) e = cfg_save_v5_packed_file(s_cfg);
+    if (e != ESP_OK && s_nvs_ok) e = nvs_save_v5_packed(s_cfg);
+
+    if (e == ESP_OK) {
+        s_cfg_dirty = false;
+    }
+    return e;
 }
 
 esp_err_t config_store_export_packed(uint8_t **out, size_t *out_len)

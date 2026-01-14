@@ -115,7 +115,7 @@ function setupImportExport() {
     bExp.addEventListener("click", () => {
       const a = document.createElement("a");
       a.href = "/api/export";
-      a.download = "footsw_cfg_v5.bin";
+      a.download = "footsw_cfg_v5.json";
       document.body.appendChild(a);
       a.click();
       a.remove();

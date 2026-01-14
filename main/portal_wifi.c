@@ -21,6 +21,7 @@
 #include "esp_system.h"
 
 #include "cJSON.h"
+#include "mbedtls/base64.h"
 
 #include "dns_hijack.h"
 #include "config_store.h"
@@ -32,9 +33,9 @@ static httpd_handle_t s_http = NULL;
 
 // --- buffer size: prefer PSRAM, fallback small internal ---
 #if CONFIG_SPIRAM
-  #define BUF_MAX 16384
+  #define BUF_MAX (512*1024)   // allow fullmax JSON (~370KB)
 #else
-  #define BUF_MAX 2048
+  #define BUF_MAX (64*1024)
 #endif
 
 static char *s_buf = NULL;
@@ -235,22 +236,58 @@ static esp_err_t h_get_export(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    httpd_resp_set_type(req, "application/octet-stream");
-    httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=footsw_cfg_v5.bin");
+    // base64 encode
+    size_t b64_need = 4 * ((len + 2) / 3) + 1;
+    char *b64 = (char *)heap_caps_malloc(b64_need, MALLOC_CAP_8BIT);
+    if (!b64) {
+        heap_caps_free(buf);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no mem");
+        return ESP_FAIL;
+    }
+
+    size_t b64_len = 0;
+    int rc = mbedtls_base64_encode((unsigned char *)b64, b64_need, &b64_len, buf, len);
+    heap_caps_free(buf);
+    if (rc != 0 || b64_len == 0) {
+        heap_caps_free(b64);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "b64 encode failed");
+        return ESP_FAIL;
+    }
+    b64[b64_len] = 0;
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=footsw_cfg_v5.json");
+
+    // stream JSON in chunks to avoid big temporary strings
+    const char *head = "{\"format\":\"packed-base64\",\"data\":\"";
+    const char *tail = "\"}\n";
+
+    if (httpd_resp_send_chunk(req, head, (ssize_t)strlen(head)) != ESP_OK) {
+        heap_caps_free(b64);
+        httpd_resp_sendstr_chunk(req, NULL);
+        return ESP_FAIL;
+    }
 
     const size_t CH = 1024;
     size_t off = 0;
-    while (off < len) {
-        size_t n = len - off;
+    while (off < b64_len) {
+        size_t n = b64_len - off;
         if (n > CH) n = CH;
-        if (httpd_resp_send_chunk(req, (const char*)buf + off, n) != ESP_OK) {
-            heap_caps_free(buf);
+        if (httpd_resp_send_chunk(req, b64 + off, (ssize_t)n) != ESP_OK) {
+            heap_caps_free(b64);
             httpd_resp_sendstr_chunk(req, NULL);
             return ESP_FAIL;
         }
         off += n;
     }
-    heap_caps_free(buf);
+
+    heap_caps_free(b64);
+
+    if (httpd_resp_send_chunk(req, tail, (ssize_t)strlen(tail)) != ESP_OK) {
+        httpd_resp_sendstr_chunk(req, NULL);
+        return ESP_FAIL;
+    }
+
     httpd_resp_sendstr_chunk(req, NULL);
     return ESP_OK;
 }

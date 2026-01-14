@@ -1,4 +1,6 @@
-﻿idf_component_register(
+﻿# ===== FILE: main/CMakeLists.txt =====
+
+idf_component_register(
   SRCS
     "app_main.c"
     "portal_wifi.c"
@@ -10,8 +12,7 @@
     "uart_midi_out.c"
     "expfs.c"
     "display_uart.c"
-  INCLUDE_DIRS
-    "."
+  INCLUDE_DIRS "."
   PRIV_REQUIRES
     nvs_flash
     esp_wifi
@@ -25,6 +26,9 @@
     json
     usb
     esp_timer
+    mbedtls
     esp_app_format
     app_update
+    bootloader_support
+    esp_partition
 )
