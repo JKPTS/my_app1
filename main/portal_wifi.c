@@ -132,9 +132,189 @@ static esp_err_t h_get_fwinfo(httpd_req_t *req)
     return ESP_OK;
 }
 
+// ---------------- firmware update ----------------
+typedef struct {
+    char magic[4];          // "FWPK"
+    uint32_t ver;           // 1
+    uint32_t app_len;       // bytes after header for app image
+    uint32_t spiffs_len;    // bytes after app image for SPIFFS image
+    uint32_t flags;         // reserved
+} fwpack_hdr_t;
+
+static inline uint32_t rd_le32(const uint8_t *p)
+{
+    return ((uint32_t)p[0]) |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static int recv_exact(httpd_req_t *req, uint8_t *dst, int n)
+{
+    int got = 0;
+    while (got < n) {
+        int r = httpd_req_recv(req, (char*)dst + got, n - got);
+        if (r <= 0) return -1;
+        got += r;
+    }
+    return got;
+}
+
+static const esp_partition_t* find_spiffs_partition(void)
+{
+    // prefer label "storage" (your partitions.csv uses it)
+    const esp_partition_t *p = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, "storage");
+    if (p) return p;
+
+    // fallback: any SPIFFS data partition
+    p = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, NULL);
+    return p;
+}
+
 static esp_err_t h_post_fwupdate(httpd_req_t *req)
 {
-    // expects raw .bin stream (Content-Type: application/octet-stream)
+    // Accept:
+    // 1) raw ESP-IDF app image (.bin)  -> OTA app only
+    // 2) FWPK package (.fwpack)        -> OTA app + SPIFFS image (single upload)
+
+    const int total = req->content_len;
+    if (total <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
+        return ESP_FAIL;
+    }
+
+    // Read a small header peek (max 20 bytes) to detect FWPK without buffering whole file.
+    uint8_t head[20];
+    int head_n = total < (int)sizeof(head) ? total : (int)sizeof(head);
+    if (recv_exact(req, head, head_n) < 0) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "recv fail");
+        return ESP_FAIL;
+    }
+
+    const bool is_fwpack = (head_n >= 4 && memcmp(head, "FWPK", 4) == 0);
+
+    if (is_fwpack) {
+        if (head_n < (int)sizeof(fwpack_hdr_t)) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "fwpack header too short");
+            return ESP_FAIL;
+        }
+
+        fwpack_hdr_t hdr;
+        memcpy(&hdr.magic[0], head + 0, 4);
+        hdr.ver       = rd_le32(head + 4);
+        hdr.app_len   = rd_le32(head + 8);
+        hdr.spiffs_len= rd_le32(head + 12);
+        hdr.flags     = rd_le32(head + 16);
+
+        if (hdr.ver != 1) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "fwpack ver unsupported");
+            return ESP_FAIL;
+        }
+
+        const int64_t expect = (int64_t)sizeof(fwpack_hdr_t) + (int64_t)hdr.app_len + (int64_t)hdr.spiffs_len;
+        if (expect != (int64_t)total) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "fwpack size mismatch");
+            return ESP_FAIL;
+        }
+
+        // ---- 1) OTA app ----
+        const esp_partition_t *update = esp_ota_get_next_update_partition(NULL);
+        if (!update) {
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no ota partition");
+            return ESP_FAIL;
+        }
+
+        esp_ota_handle_t ota = 0;
+        esp_err_t e = esp_ota_begin(update, OTA_SIZE_UNKNOWN, &ota);
+        if (e != ESP_OK) {
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ota begin failed");
+            return ESP_FAIL;
+        }
+
+        uint8_t buf[1024];
+        int remaining = (int)hdr.app_len;
+        while (remaining > 0) {
+            int to_read = remaining > (int)sizeof(buf) ? (int)sizeof(buf) : remaining;
+            int r = httpd_req_recv(req, (char*)buf, to_read);
+            if (r <= 0) {
+                esp_ota_abort(ota);
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "recv fail (app)");
+                return ESP_FAIL;
+            }
+            e = esp_ota_write(ota, buf, r);
+            if (e != ESP_OK) {
+                esp_ota_abort(ota);
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ota write failed");
+                return ESP_FAIL;
+            }
+            remaining -= r;
+        }
+
+        e = esp_ota_end(ota);
+        if (e != ESP_OK) {
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ota end failed");
+            return ESP_FAIL;
+        }
+
+        e = esp_ota_set_boot_partition(update);
+        if (e != ESP_OK) {
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "set boot failed");
+            return ESP_FAIL;
+        }
+
+        // ---- 2) SPIFFS image ----
+        const esp_partition_t *sp = find_spiffs_partition();
+        if (!sp) {
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no spiffs partition");
+            return ESP_FAIL;
+        }
+
+        if ((uint32_t)hdr.spiffs_len > sp->size) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "spiffs too large");
+            return ESP_FAIL;
+        }
+
+        // Unregister SPIFFS before raw partition write (safe even if not mounted).
+        (void)esp_vfs_spiffs_unregister(NULL);
+
+        // Erase required range (flash sectors are 4KB)
+        uint32_t erase_len = (hdr.spiffs_len + 0xFFFu) & ~0xFFFu;
+        if (erase_len > sp->size) erase_len = sp->size;
+
+        e = esp_partition_erase_range(sp, 0, erase_len);
+        if (e != ESP_OK) {
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "spiffs erase failed");
+            return ESP_FAIL;
+        }
+
+        remaining = (int)hdr.spiffs_len;
+        size_t off = 0;
+        while (remaining > 0) {
+            int to_read = remaining > (int)sizeof(buf) ? (int)sizeof(buf) : remaining;
+            int r = httpd_req_recv(req, (char*)buf, to_read);
+            if (r <= 0) {
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "recv fail (spiffs)");
+                return ESP_FAIL;
+            }
+            e = esp_partition_write(sp, off, buf, r);
+            if (e != ESP_OK) {
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "spiffs write failed");
+                return ESP_FAIL;
+            }
+            off += r;
+            remaining -= r;
+        }
+
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"ok\":true,\"reboot\":true,\"mode\":\"fwpack\"}");
+
+        xTaskCreate(restart_later_task, "restart_later", 2048, NULL, 5, NULL);
+        return ESP_OK;
+    }
+
+    // ---- raw app.bin path ----
     const esp_partition_t *update = esp_ota_get_next_update_partition(NULL);
     if (!update) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no ota partition");
@@ -148,12 +328,18 @@ static esp_err_t h_post_fwupdate(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    // small recv buffer (stack) to avoid using the portal shared buffer
+    // Write the already-received head_n bytes first
+    e = esp_ota_write(ota, head, head_n);
+    if (e != ESP_OK) {
+        esp_ota_abort(ota);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ota write failed");
+        return ESP_FAIL;
+    }
+
     uint8_t buf[1024];
-    int remaining = req->content_len;
+    int remaining = total - head_n;
     while (remaining > 0) {
-        int to_read = remaining;
-        if (to_read > (int)sizeof(buf)) to_read = (int)sizeof(buf);
+        int to_read = remaining > (int)sizeof(buf) ? (int)sizeof(buf) : remaining;
         int r = httpd_req_recv(req, (char*)buf, to_read);
         if (r <= 0) {
             esp_ota_abort(ota);
@@ -182,9 +368,8 @@ static esp_err_t h_post_fwupdate(httpd_req_t *req)
     }
 
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, "{\"ok\":true,\"reboot\":true}");
+    httpd_resp_sendstr(req, "{\"ok\":true,\"reboot\":true,\"mode\":\"app\"}");
 
-    // reboot after response flush
     xTaskCreate(restart_later_task, "restart_later", 2048, NULL, 5, NULL);
     return ESP_OK;
 }

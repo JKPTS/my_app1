@@ -152,14 +152,31 @@ function setupImportExport() {
 function setupFirmwareUpdate() {
   const b = $("fwUpload");
   const f = $("fwFile");
+  // allow selecting both app (.bin) and combined package (.fwpack)
+  try { if (f) f.setAttribute("accept", ".bin,.fwpack,application/octet-stream"); } catch (_) {}
+
   const st = $("fwStatus");
   const pr = $("fwProg");
   if (!b || !f) return;
 
-  b.addEventListener("click", () => {
+  async function waitBackOnline(timeoutMs = 60000) {
+    const t0 = nowMs();
+    while (nowMs() - t0 < timeoutMs) {
+      try {
+        await apiGet("/api/fwinfo");
+        return true;
+      } catch (e) {
+        // ignore
+      }
+      await new Promise((r) => setTimeout(r, 1200));
+    }
+    return false;
+  }
+
+  b.addEventListener("click", async () => {
     const file = f.files && f.files[0];
     if (!file) {
-      if (st) st.textContent = "select a .bin first";
+      if (st) st.textContent = "select a .bin (or .fwpack) first";
       return;
     }
 
@@ -172,20 +189,36 @@ function setupFirmwareUpdate() {
     xhr.setRequestHeader("Content-Type", "application/octet-stream");
 
     xhr.upload.onprogress = (ev) => {
-      if (pr && ev.lengthComputable) {
-        pr.value = Math.round((ev.loaded / ev.total) * 100);
-      }
+      if (pr && ev.lengthComputable) pr.value = Math.round((ev.loaded / ev.total) * 100);
     };
+
     xhr.onerror = () => {
       if (st) st.textContent = "upload failed";
       b.disabled = false;
     };
-    xhr.onload = () => {
+
+    xhr.onload = async () => {
       b.disabled = false;
+
       if (xhr.status >= 200 && xhr.status < 300) {
-        if (st) st.textContent = "uploaded ✅ rebooting…";
+        let mode = "";
+        try {
+          const j = JSON.parse(xhr.responseText || "{}");
+          mode = j.mode || "";
+        } catch (e) {}
+
+        if (st) st.textContent = `uploaded ✅ (${mode || "app"}) rebooting…`;
+
+        // best-effort: wait for reboot + reload fw info
+        const ok = await waitBackOnline(60000);
+        if (ok) {
+          await loadFwInfo();
+          if (st) st.textContent = "device is back online ✅";
+        } else {
+          if (st) st.textContent = "rebooting… if it doesn't come back, reconnect Wi‑Fi then reload";
+        }
       } else {
-        if (st) st.textContent = "upload failed: " + xhr.responseText;
+        if (st) st.textContent = "upload failed: " + (xhr.responseText || xhr.statusText);
       }
     };
 
