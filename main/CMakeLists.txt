@@ -12,6 +12,8 @@ idf_component_register(
     "uart_midi_out.c"
     "expfs.c"
     "display_uart.c"
+    "rgb_led.c"
+    "rgb_store.c"
   INCLUDE_DIRS "."
   PRIV_REQUIRES
     nvs_flash
@@ -31,4 +33,5 @@ idf_component_register(
     app_update
     bootloader_support
     esp_partition
+    led_strip
 )

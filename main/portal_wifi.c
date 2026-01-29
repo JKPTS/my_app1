@@ -27,6 +27,7 @@
 #include "config_store.h"
 #include "footswitch.h"
 #include "expfs.h"
+#include "rgb_store.h"
 
 static const char *TAG = "PORTAL";
 static httpd_handle_t s_http = NULL;
@@ -107,6 +108,8 @@ static esp_err_t send_spiffs_file(httpd_req_t *req, const char *path, const char
 static esp_err_t h_root(httpd_req_t *req) { return send_spiffs_file(req, "/spiffs/index.html", "text/html"); }
 static esp_err_t h_js(httpd_req_t *req)   { return send_spiffs_file(req, "/spiffs/app.js", "application/javascript"); }
 static esp_err_t h_css(httpd_req_t *req)  { return send_spiffs_file(req, "/spiffs/style.css", "text/css"); }
+static esp_err_t h_rgb_page(httpd_req_t *req) { return send_spiffs_file(req, "/spiffs/rgb.html", "text/html"); }
+static esp_err_t h_rgb_js(httpd_req_t *req)   { return send_spiffs_file(req, "/spiffs/rgb.js", "application/javascript"); }
 
 // ---------------- firmware info/update ----------------
 static void restart_later_task(void *arg)
@@ -132,189 +135,9 @@ static esp_err_t h_get_fwinfo(httpd_req_t *req)
     return ESP_OK;
 }
 
-// ---------------- firmware update ----------------
-typedef struct {
-    char magic[4];          // "FWPK"
-    uint32_t ver;           // 1
-    uint32_t app_len;       // bytes after header for app image
-    uint32_t spiffs_len;    // bytes after app image for SPIFFS image
-    uint32_t flags;         // reserved
-} fwpack_hdr_t;
-
-static inline uint32_t rd_le32(const uint8_t *p)
-{
-    return ((uint32_t)p[0]) |
-           ((uint32_t)p[1] << 8) |
-           ((uint32_t)p[2] << 16) |
-           ((uint32_t)p[3] << 24);
-}
-
-static int recv_exact(httpd_req_t *req, uint8_t *dst, int n)
-{
-    int got = 0;
-    while (got < n) {
-        int r = httpd_req_recv(req, (char*)dst + got, n - got);
-        if (r <= 0) return -1;
-        got += r;
-    }
-    return got;
-}
-
-static const esp_partition_t* find_spiffs_partition(void)
-{
-    // prefer label "storage" (your partitions.csv uses it)
-    const esp_partition_t *p = esp_partition_find_first(
-        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, "storage");
-    if (p) return p;
-
-    // fallback: any SPIFFS data partition
-    p = esp_partition_find_first(
-        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, NULL);
-    return p;
-}
-
 static esp_err_t h_post_fwupdate(httpd_req_t *req)
 {
-    // Accept:
-    // 1) raw ESP-IDF app image (.bin)  -> OTA app only
-    // 2) FWPK package (.fwpack)        -> OTA app + SPIFFS image (single upload)
-
-    const int total = req->content_len;
-    if (total <= 0) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
-        return ESP_FAIL;
-    }
-
-    // Read a small header peek (max 20 bytes) to detect FWPK without buffering whole file.
-    uint8_t head[20];
-    int head_n = total < (int)sizeof(head) ? total : (int)sizeof(head);
-    if (recv_exact(req, head, head_n) < 0) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "recv fail");
-        return ESP_FAIL;
-    }
-
-    const bool is_fwpack = (head_n >= 4 && memcmp(head, "FWPK", 4) == 0);
-
-    if (is_fwpack) {
-        if (head_n < (int)sizeof(fwpack_hdr_t)) {
-            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "fwpack header too short");
-            return ESP_FAIL;
-        }
-
-        fwpack_hdr_t hdr;
-        memcpy(&hdr.magic[0], head + 0, 4);
-        hdr.ver       = rd_le32(head + 4);
-        hdr.app_len   = rd_le32(head + 8);
-        hdr.spiffs_len= rd_le32(head + 12);
-        hdr.flags     = rd_le32(head + 16);
-
-        if (hdr.ver != 1) {
-            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "fwpack ver unsupported");
-            return ESP_FAIL;
-        }
-
-        const int64_t expect = (int64_t)sizeof(fwpack_hdr_t) + (int64_t)hdr.app_len + (int64_t)hdr.spiffs_len;
-        if (expect != (int64_t)total) {
-            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "fwpack size mismatch");
-            return ESP_FAIL;
-        }
-
-        // ---- 1) OTA app ----
-        const esp_partition_t *update = esp_ota_get_next_update_partition(NULL);
-        if (!update) {
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no ota partition");
-            return ESP_FAIL;
-        }
-
-        esp_ota_handle_t ota = 0;
-        esp_err_t e = esp_ota_begin(update, OTA_SIZE_UNKNOWN, &ota);
-        if (e != ESP_OK) {
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ota begin failed");
-            return ESP_FAIL;
-        }
-
-        uint8_t buf[1024];
-        int remaining = (int)hdr.app_len;
-        while (remaining > 0) {
-            int to_read = remaining > (int)sizeof(buf) ? (int)sizeof(buf) : remaining;
-            int r = httpd_req_recv(req, (char*)buf, to_read);
-            if (r <= 0) {
-                esp_ota_abort(ota);
-                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "recv fail (app)");
-                return ESP_FAIL;
-            }
-            e = esp_ota_write(ota, buf, r);
-            if (e != ESP_OK) {
-                esp_ota_abort(ota);
-                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ota write failed");
-                return ESP_FAIL;
-            }
-            remaining -= r;
-        }
-
-        e = esp_ota_end(ota);
-        if (e != ESP_OK) {
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ota end failed");
-            return ESP_FAIL;
-        }
-
-        e = esp_ota_set_boot_partition(update);
-        if (e != ESP_OK) {
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "set boot failed");
-            return ESP_FAIL;
-        }
-
-        // ---- 2) SPIFFS image ----
-        const esp_partition_t *sp = find_spiffs_partition();
-        if (!sp) {
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no spiffs partition");
-            return ESP_FAIL;
-        }
-
-        if ((uint32_t)hdr.spiffs_len > sp->size) {
-            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "spiffs too large");
-            return ESP_FAIL;
-        }
-
-        // Unregister SPIFFS before raw partition write (safe even if not mounted).
-        (void)esp_vfs_spiffs_unregister(NULL);
-
-        // Erase required range (flash sectors are 4KB)
-        uint32_t erase_len = (hdr.spiffs_len + 0xFFFu) & ~0xFFFu;
-        if (erase_len > sp->size) erase_len = sp->size;
-
-        e = esp_partition_erase_range(sp, 0, erase_len);
-        if (e != ESP_OK) {
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "spiffs erase failed");
-            return ESP_FAIL;
-        }
-
-        remaining = (int)hdr.spiffs_len;
-        size_t off = 0;
-        while (remaining > 0) {
-            int to_read = remaining > (int)sizeof(buf) ? (int)sizeof(buf) : remaining;
-            int r = httpd_req_recv(req, (char*)buf, to_read);
-            if (r <= 0) {
-                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "recv fail (spiffs)");
-                return ESP_FAIL;
-            }
-            e = esp_partition_write(sp, off, buf, r);
-            if (e != ESP_OK) {
-                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "spiffs write failed");
-                return ESP_FAIL;
-            }
-            off += r;
-            remaining -= r;
-        }
-
-        httpd_resp_set_type(req, "application/json");
-        httpd_resp_sendstr(req, "{\"ok\":true,\"reboot\":true,\"mode\":\"fwpack\"}");
-
-        xTaskCreate(restart_later_task, "restart_later", 2048, NULL, 5, NULL);
-        return ESP_OK;
-    }
-
-    // ---- raw app.bin path ----
+    // expects raw .bin stream (Content-Type: application/octet-stream)
     const esp_partition_t *update = esp_ota_get_next_update_partition(NULL);
     if (!update) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no ota partition");
@@ -328,18 +151,12 @@ static esp_err_t h_post_fwupdate(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    // Write the already-received head_n bytes first
-    e = esp_ota_write(ota, head, head_n);
-    if (e != ESP_OK) {
-        esp_ota_abort(ota);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ota write failed");
-        return ESP_FAIL;
-    }
-
+    // small recv buffer (stack) to avoid using the portal shared buffer
     uint8_t buf[1024];
-    int remaining = total - head_n;
+    int remaining = req->content_len;
     while (remaining > 0) {
-        int to_read = remaining > (int)sizeof(buf) ? (int)sizeof(buf) : remaining;
+        int to_read = remaining;
+        if (to_read > (int)sizeof(buf)) to_read = (int)sizeof(buf);
         int r = httpd_req_recv(req, (char*)buf, to_read);
         if (r <= 0) {
             esp_ota_abort(ota);
@@ -368,8 +185,9 @@ static esp_err_t h_post_fwupdate(httpd_req_t *req)
     }
 
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, "{\"ok\":true,\"reboot\":true,\"mode\":\"app\"}");
+    httpd_resp_sendstr(req, "{\"ok\":true,\"reboot\":true}");
 
+    // reboot after response flush
     xTaskCreate(restart_later_task, "restart_later", 2048, NULL, 5, NULL);
     return ESP_OK;
 }
@@ -557,6 +375,162 @@ static esp_err_t h_post_led(httpd_req_t *req)
     httpd_resp_sendstr(req, "{\"ok\":true}");
     return ESP_OK;
 }
+
+// -------- API: RGB (WS2812 global color) --------
+static int parse_hex6(const char *s, uint32_t *out_hex)
+{
+    if (!s || !out_hex) return 0;
+    // accept "#RRGGBB" or "RRGGBB"
+    if (s[0] == '#') s++;
+    if (strlen(s) != 6) return 0;
+
+    char *endp = NULL;
+    unsigned long v = strtoul(s, &endp, 16);
+    if (!endp || *endp != '\0') return 0;
+
+    *out_hex = (uint32_t)(v & 0xFFFFFFu);
+    return 1;
+}
+
+static esp_err_t h_get_rgb(httpd_req_t *req)
+{
+    // return per-pixel colors as ["#RRGGBB", ...]
+    int n = rgb_store_count();
+    if (n <= 0) n = 0;
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "count", n);
+
+    cJSON *arr = cJSON_CreateArray();
+    for (int i = 0; i < n; i++) {
+        uint32_t hex = rgb_store_get_pixel_hex(i) & 0xFFFFFFu;
+        char s[10];
+        snprintf(s, sizeof(s), "#%06lx", (unsigned long)hex);
+        cJSON_AddItemToArray(arr, cJSON_CreateString(s));
+    }
+    cJSON_AddItemToObject(root, "colors", arr);
+
+    char *out = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+
+    if (!out) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json fail");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, out);
+    free(out);
+    return ESP_OK;
+}
+
+static esp_err_t h_post_rgb(httpd_req_t *req)
+{
+    int total = req->content_len;
+    if (total <= 0 || total > 1024) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad body");
+        return ESP_FAIL;
+    }
+
+    char buf[1025];
+    int got = 0;
+    while (got < total) {
+        int r = httpd_req_recv(req, buf + got, total - got);
+        if (r <= 0) {
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "recv fail");
+            return ESP_FAIL;
+        }
+        got += r;
+    }
+    buf[total] = 0;
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad json"); return ESP_FAIL; }
+
+    // Supported payloads:
+    // 1) { "idx": <int>, "hex": "#RRGGBB" }               -> set one pixel
+    // 2) { "colors": ["#RRGGBB", ...] }                  -> set all (or first N)
+    // 3) { "hex": "#RRGGBB" }                            -> compatibility: set all to same
+
+    cJSON *jcolors = cJSON_GetObjectItem(root, "colors");
+    cJSON *jidx    = cJSON_GetObjectItem(root, "idx");
+    cJSON *jhex    = cJSON_GetObjectItem(root, "hex");
+
+    esp_err_t e = ESP_OK;
+
+    if (cJSON_IsArray(jcolors)) {
+        int n = cJSON_GetArraySize(jcolors);
+        if (n <= 0) {
+            cJSON_Delete(root);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty colors");
+            return ESP_FAIL;
+        }
+
+        int maxn = rgb_store_count();
+        if (n > maxn) n = maxn;
+
+        // Use VLA sized to the configured pixel count (typically 8)
+        uint32_t tmp[maxn];
+        for (int i = 0; i < n; i++) {
+            cJSON *it = cJSON_GetArrayItem(jcolors, i);
+            if (!cJSON_IsString(it) || !it->valuestring) {
+                cJSON_Delete(root);
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad colors");
+                return ESP_FAIL;
+            }
+            uint32_t hx = 0;
+            if (!parse_hex6(it->valuestring, &hx)) {
+                cJSON_Delete(root);
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad hex");
+                return ESP_FAIL;
+            }
+            tmp[i] = hx & 0xFFFFFFu;
+        }
+
+        cJSON_Delete(root);
+        e = rgb_store_set_all_hex(tmp, n);
+    }
+    else if (cJSON_IsNumber(jidx) && cJSON_IsString(jhex) && jhex->valuestring) {
+        int idx = jidx->valueint;
+        uint32_t hx = 0;
+        if (!parse_hex6(jhex->valuestring, &hx)) {
+            cJSON_Delete(root);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad hex");
+            return ESP_FAIL;
+        }
+        cJSON_Delete(root);
+        e = rgb_store_set_pixel_hex(idx, hx);
+    }
+    else if (cJSON_IsString(jhex) && jhex->valuestring) {
+        uint32_t hx = 0;
+        if (!parse_hex6(jhex->valuestring, &hx)) {
+            cJSON_Delete(root);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad hex");
+            return ESP_FAIL;
+        }
+        cJSON_Delete(root);
+        e = rgb_store_set_hex(hx);
+    }
+    else {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad json fields");
+        return ESP_FAIL;
+    }
+
+    if (e != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "save failed");
+        return ESP_FAIL;
+    }
+
+    // Apply immediately (brightness comes from /api/led)
+    rgb_store_apply();
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+
 
 
 // -------- API: EXPFS (global exp/fs ports) --------
@@ -1012,6 +986,8 @@ static void start_http_server(void)
     httpd_uri_t u_root = { .uri="/", .method=HTTP_GET, .handler=h_root };
     httpd_uri_t u_js   = { .uri="/app.js", .method=HTTP_GET, .handler=h_js };
     httpd_uri_t u_css  = { .uri="/style.css", .method=HTTP_GET, .handler=h_css };
+    httpd_uri_t u_rgbp = { .uri="/rgb", .method=HTTP_GET, .handler=h_rgb_page };
+    httpd_uri_t u_rgbjs= { .uri="/rgb.js", .method=HTTP_GET, .handler=h_rgb_js };
 
     // firmware update
     httpd_uri_t u_fwinfo = { .uri="/api/fwinfo", .method=HTTP_GET,  .handler=h_get_fwinfo };
@@ -1042,6 +1018,9 @@ static void start_http_server(void)
     httpd_uri_t u_led_g = { .uri="/api/led", .method=HTTP_GET,  .handler=h_get_led };
     httpd_uri_t u_led_p = { .uri="/api/led", .method=HTTP_POST, .handler=h_post_led };
 
+    httpd_uri_t u_rgb_g = { .uri="/api/rgb", .method=HTTP_GET,  .handler=h_get_rgb };
+    httpd_uri_t u_rgb_p = { .uri="/api/rgb", .method=HTTP_POST, .handler=h_post_rgb };
+
     httpd_uri_t u_expfs_g = { .uri="/api/expfs", .method=HTTP_GET,  .handler=h_get_expfs };
     httpd_uri_t u_expfs_p = { .uri="/api/expfs", .method=HTTP_POST, .handler=h_post_expfs };
     httpd_uri_t u_expfs_cal = { .uri="/api/expfs_cal", .method=HTTP_POST, .handler=h_post_expfs_cal };
@@ -1049,6 +1028,8 @@ static void start_http_server(void)
     reg_uri(s_http, &u_root,  "root");
     reg_uri(s_http, &u_js,    "js");
     reg_uri(s_http, &u_css,   "css");
+    reg_uri(s_http, &u_rgbp,  "rgb_page");
+    reg_uri(s_http, &u_rgbjs, "rgb_js");
 
     reg_uri(s_http, &u_fwinfo, "fwinfo");
     reg_uri(s_http, &u_fwupd,  "fwupdate");
@@ -1075,6 +1056,8 @@ static void start_http_server(void)
 
     reg_uri(s_http, &u_led_g, "led_get");
     reg_uri(s_http, &u_led_p, "led_post");
+    reg_uri(s_http, &u_rgb_g, "rgb_get");
+    reg_uri(s_http, &u_rgb_p, "rgb_post");
 
     reg_uri(s_http, &u_expfs_g, "expfs_get");
     reg_uri(s_http, &u_expfs_p, "expfs_post");

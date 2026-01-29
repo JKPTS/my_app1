@@ -12,6 +12,9 @@
 #include "uart_midi_out.h"
 #include "expfs.h"
 
+#include "rgb_led.h"
+#include "rgb_store.h"
+
 #include "display_uart.h"
 #include "nvs_flash.h"
 
@@ -47,6 +50,35 @@ static void bootstrap_task(void *arg)
     // 2) config
     ESP_LOGI(TAG, "config_store_init()");
     config_store_init();
+
+    // 2.1) rgb (PWM LED)
+    ESP_LOGI(TAG, "rgb_led_init()");
+    esp_err_t rgb_err = rgb_led_init();
+    if (rgb_err != ESP_OK) {
+        ESP_LOGE(TAG, "rgb_led_init failed: %s", esp_err_to_name(rgb_err));
+    } else {
+        ESP_LOGI(TAG, "rgb_store_init()");
+        esp_err_t st_err = rgb_store_init();
+        if (st_err != ESP_OK) {
+            ESP_LOGE(TAG, "rgb_store_init failed: %s", esp_err_to_name(st_err));
+        }
+        ESP_LOGI(TAG, "rgb_store_apply()");
+        rgb_store_apply();
+
+        // ✅ make LEDs visibly turn on at boot (colors from NVS/web show immediately)
+        // Footswitch task can still take control later via rgb_led_set_pixel_on().
+        rgb_led_all_on();
+
+        // Quick self-test: blink pixel 0 (helps confirm wiring/pin/power)
+        for (int k = 0; k < 6; k++) {
+            rgb_led_set_pixel_hex(0, 0xFF0000);
+            rgb_led_set_pixel_on(0, 1);
+            vTaskDelay(pdMS_TO_TICKS(150));
+            rgb_led_set_pixel_hex(0, 0x00FF00);
+            rgb_led_set_pixel_on(0, 1);
+            vTaskDelay(pdMS_TO_TICKS(150));
+        }
+    }
 
     ESP_LOGI(TAG, "display_uart_init()");
     display_uart_init();

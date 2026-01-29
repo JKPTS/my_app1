@@ -6,14 +6,13 @@
 #include "freertos/task.h"
 
 #include "driver/gpio.h"
-#include "driver/ledc.h"
-
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 
 #include "footswitch.h"
 #include "config_store.h"
 #include "midi_actions.h"
+#include "rgb_led.h"
 
 static const char *TAG = "FOOTSW";
 
@@ -23,15 +22,7 @@ static const gpio_num_t sw_pins[8] = {
     (gpio_num_t)4,  (gpio_num_t)5,  (gpio_num_t)6,  (gpio_num_t)7
 };
 
-// -------------------- leds --------------------
-static const gpio_num_t led_pins[8] = {
-    (gpio_num_t)8,  (gpio_num_t)3,  (gpio_num_t)9,  (gpio_num_t)10,
-    (gpio_num_t)11, (gpio_num_t)12, (gpio_num_t)13, (gpio_num_t)14
-};
-
-// 0 = active-high (1=ติด), 1 = active-low (0=ติด)
-#define LED_ACTIVE_LOW 0
-
+// -------------------- core state helpers --------------------
 static footswitch_state_t s_state = {0};
 
 static inline int wrapi(int v, int max)
@@ -42,51 +33,26 @@ static inline int wrapi(int v, int max)
     return r;
 }
 
-static inline int pressed(int idx) { return gpio_get_level(sw_pins[idx]) == 0; } // pull-up: pressed=0
+// pull-up: pressed = 0
+static inline int pressed(int idx) { return gpio_get_level(sw_pins[idx]) == 0; }
 
-// -------------------- led (PWM) helpers --------------------
-static const ledc_mode_t  LEDC_MODE  = LEDC_LOW_SPEED_MODE;
-static const ledc_timer_t LEDC_TIMER = LEDC_TIMER_0;
+// -------------------- leds (WS2812) --------------------
+// ใช้ WS2812 (NeoPixel) 8 ดวงเป็น ring
+// - ควบคุมด้วย data pin เดียว (ดู RGB_LED_STRIP_GPIO ใน rgb_led.h)
+// - แต่ละดวง: ON = แสดงสี global (จาก rgb_store / web), OFF = ดับ
+//
+// NOTE: ใช้ rgb_led_set_pixel_on() ในการเปิด/ปิดแต่ละดวง
 
-static const ledc_channel_t LEDC_CH[8] = {
-    LEDC_CHANNEL_0, LEDC_CHANNEL_1, LEDC_CHANNEL_2, LEDC_CHANNEL_3,
-    LEDC_CHANNEL_4, LEDC_CHANNEL_5, LEDC_CHANNEL_6, LEDC_CHANNEL_7
-};
 
-static uint8_t  s_led_on[8];
-static uint8_t  s_brightness = 100;     // 0..100
-static uint32_t s_duty_max = 8191;      // 13-bit default
+static uint8_t s_led_on[8];
+static uint8_t s_brightness = 100;     // 0..100
 
-static void ledc_apply_one(int idx)
-{
-    if (idx < 0 || idx >= 8) return;
-
-    uint32_t duty = 0;
-    uint32_t scaled = (s_duty_max * (uint32_t)s_brightness) / 100u;
-
-#if LED_ACTIVE_LOW
-    if (s_led_on[idx]) duty = (s_duty_max >= scaled) ? (s_duty_max - scaled) : 0;
-    else duty = s_duty_max;
-#else
-    if (s_led_on[idx]) duty = scaled;
-    else duty = 0;
-#endif
-
-    ledc_set_duty(LEDC_MODE, LEDC_CH[idx], duty);
-    ledc_update_duty(LEDC_MODE, LEDC_CH[idx]);
-}
-
-static void led_apply_all(void)
-{
-    for (int i = 0; i < 8; i++) ledc_apply_one(i);
-}
-
-static void led_set_brightness(uint8_t percent)
+static inline void led_set_brightness(uint8_t percent)
 {
     if (percent > 100) percent = 100;
     if (s_brightness == percent) return;
     s_brightness = percent;
-    led_apply_all();
+    rgb_led_set_brightness(s_brightness);
 }
 
 static inline void led_write_raw(int idx, int on)
@@ -95,13 +61,21 @@ static inline void led_write_raw(int idx, int on)
     uint8_t v = on ? 1u : 0u;
     if (s_led_on[idx] == v) return;
     s_led_on[idx] = v;
-    ledc_apply_one(idx);
+    rgb_led_set_pixel_on(idx, v ? 1 : 0);
 }
 
 static inline void led_on(int idx)  { led_write_raw(idx, 1); }
 static inline void led_off(int idx) { led_write_raw(idx, 0); }
 
+static inline void led_apply_all(void)
+{
+    // apply cached ON/OFF to strip
+    for (int i = 0; i < 8; i++) rgb_led_set_pixel_on(i, s_led_on[i] ? 1 : 0);
+}
+
+
 // -------------------- run helpers --------------------
+
 static void run_actions_trigger_list(const action_t *list, cc_behavior_t cc_beh)
 {
     midi_actions_run(list, MAX_ACTIONS, cc_beh, MIDI_EVT_TRIGGER);
@@ -287,34 +261,15 @@ static void foot_task(void *arg)
     for (int i = 0; i < 8; i++) io.pin_bit_mask |= (1ULL << sw_pins[i]);
     gpio_config(&io);
 
-    // ledc timer + channels
-    ledc_timer_config_t tc = {
-        .speed_mode       = LEDC_MODE,
-        .duty_resolution  = LEDC_TIMER_13_BIT,
-        .timer_num        = LEDC_TIMER,
-        .freq_hz          = 5000,
-        .clk_cfg          = LEDC_AUTO_CLK,
-    };
-    ledc_timer_config(&tc);
-    s_duty_max = (1u << 13) - 1u;
+    // ws2812 init (strip already created in app_main, but safe to call again)
+    rgb_led_init();
 
-    for (int i = 0; i < 8; i++) {
-        ledc_channel_config_t cc = {
-            .gpio_num   = led_pins[i],
-            .speed_mode = LEDC_MODE,
-            .channel    = LEDC_CH[i],
-            .intr_type  = LEDC_INTR_DISABLE,
-            .timer_sel  = LEDC_TIMER,
-            .duty       = 0,
-            .hpoint     = 0,
-        };
-        ledc_channel_config(&cc);
-    }
 
     // init cache
     memset(s_led_on, 0, sizeof(s_led_on));
     s_brightness = config_store_get_led_brightness();
     if (s_brightness > 100) s_brightness = 100;
+    rgb_led_set_brightness(s_brightness);
 
     // default: turn all ON (guide)
     for (int i = 0; i < 8; i++) s_led_on[i] = 1;

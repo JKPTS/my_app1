@@ -23,6 +23,7 @@
 
 #include "config_store.h"
 #include "display_uart.h"
+#include "rgb_store.h"
 
 static const char *TAG = "CFG";
 
@@ -1541,7 +1542,12 @@ esp_err_t config_store_set_led_brightness(uint8_t percent)
 {
     if (percent > 100) percent = 100;
     s_led_brightness = percent;
-    return nvs_save_led_brightness(s_led_brightness);
+    esp_err_t err = nvs_save_led_brightness(s_led_brightness);
+    if (err == ESP_OK) {
+        // keep RGB PWM LED brightness in sync
+        rgb_store_apply();
+    }
+    return err;
 }
 
 // ---- a+b led selection public API ----

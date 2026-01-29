@@ -1,0 +1,4 @@
+version: "1.0.0"
+description: "main application component"
+dependencies:
+  espressif/led_strip: "^3.0.2"
