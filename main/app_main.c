@@ -68,16 +68,6 @@ static void bootstrap_task(void *arg)
         // ✅ make LEDs visibly turn on at boot (colors from NVS/web show immediately)
         // Footswitch task can still take control later via rgb_led_set_pixel_on().
         rgb_led_all_on();
-
-        // Quick self-test: blink pixel 0 (helps confirm wiring/pin/power)
-        for (int k = 0; k < 6; k++) {
-            rgb_led_set_pixel_hex(0, 0xFF0000);
-            rgb_led_set_pixel_on(0, 1);
-            vTaskDelay(pdMS_TO_TICKS(150));
-            rgb_led_set_pixel_hex(0, 0x00FF00);
-            rgb_led_set_pixel_on(0, 1);
-            vTaskDelay(pdMS_TO_TICKS(150));
-        }
     }
 
     ESP_LOGI(TAG, "display_uart_init()");

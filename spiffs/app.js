@@ -20,10 +20,6 @@ let lastUserNavAt = 0;
 const MAX_BANK_NAME = 10;
 const MAX_SWITCH_NAME = 5;
 
-// led brightness save timer
-let tSaveLed = null;
-let dirtyLed = false;
-
 let dirtyBtn = false;
 let dirtyLayout = false;
 let dirtyBank = false;
@@ -39,8 +35,6 @@ let expfsSavePromise = [Promise.resolve(), Promise.resolve()];
 let btnVer = 0, btnSaving = false, btnSavePromise = Promise.resolve();
 let layoutVer = 0, layoutSaving = false, layoutSavePromise = Promise.resolve();
 let bankVer = 0, bankSaving = false, bankSavePromise = Promise.resolve();
-let ledVer = 0, ledSaving = false, ledSavePromise = Promise.resolve();
-
 function nowMs() { return Date.now(); }
 
 function wrap(n, max) {
@@ -239,15 +233,11 @@ function hookFinishedTypingInput(inp, onDirty, onFinish) {
 async function flushPendingSaves() {
   forceCommitActiveField();
 
-  await Promise.all([layoutSavePromise, bankSavePromise, btnSavePromise, ledSavePromise, expfsSavePromise[0], expfsSavePromise[1]]);
+  await Promise.all([layoutSavePromise, bankSavePromise, btnSavePromise, expfsSavePromise[0], expfsSavePromise[1]]);
 
   if (dirtyLayout) await saveLayoutImmediate();
   if (dirtyBank) await saveBankImmediate();
   if (dirtyBtn) await saveButtonImmediate();
-
-  if (tSaveLed) { clearTimeout(tSaveLed); tSaveLed = null; }
-  if (dirtyLed) await saveLedImmediate();
-
   if (expfsDirty[0]) await saveExpfsPortImmediate(0);
   if (expfsDirty[1]) await saveExpfsPortImmediate(1);
 }
@@ -716,55 +706,6 @@ async function saveBankImmediate() {
   renderHeader();
 }
 
-// ---------- led brightness ----------
-async function loadLedBrightness() {
-  const r = await apiGet("/api/led");
-  let v = clampInt(r?.brightness ?? 100, 0, 100);
-  must("ledBrightness").value = String(v);
-  must("ledBrightnessVal").textContent = String(v);
-}
-
-async function saveLedBrightness() {
-  const v = clampInt(must("ledBrightness").value ?? 100, 0, 100);
-  await apiPost("/api/led", { brightness: v });
-}
-
-function markLedDirty() {
-  if (LOADING) return;
-  dirtyLed = true;
-  ledVer++;
-}
-
-function requestSaveLedAfterFinish() {
-  if (LOADING) return;
-  if (!dirtyLed) return;
-
-  if (tSaveLed) { clearTimeout(tSaveLed); tSaveLed = null; }
-  tSaveLed = setTimeout(() => {
-    if (ledSaving) return;
-    ledSaving = true;
-
-    ledSavePromise = (async () => {
-      while (true) {
-        const v = ledVer;
-        try {
-          await saveLedBrightness();
-          if (ledVer === v) {
-            dirtyLed = false;
-            setMsg("saved ✅");
-            break;
-          }
-        } catch (e) {
-          setMsg("save led failed: " + e.message, false);
-          break;
-        }
-        await new Promise((r) => setTimeout(r, 0));
-      }
-      ledSaving = false;
-    })();
-  }, 250);
-}
-
 // ---------- exp/fs autosave ----------
 function markExpfsDirty(port) {
   if (LOADING) return;
@@ -808,14 +749,6 @@ async function saveExpfsPortImmediate(port) {
   setMsg("saved ✅");
 }
 
-
-async function saveLedImmediate() {
-  if (LOADING) return;
-  dirtyLed = true;
-  ledVer++;
-  requestSaveLedAfterFinish();
-  return ledSavePromise;
-}
 
 // ---------- load/save ----------
 async function loadMeta() {
@@ -932,7 +865,7 @@ async function loadButton() {
     highlightGrid();
     renderHeader();
 
-    dirtyBtn = false; dirtyLayout = false; dirtyBank = false; dirtyLed = false;
+    dirtyBtn = false; dirtyLayout = false; dirtyBank = false;
   } finally {
     LOADING = false;
   }
@@ -1574,20 +1507,6 @@ function setupUI() {
   };
   hookFinishedTypingInput(switchName, () => {}, requestSaveBankAfterFinish);
 
-  // led brightness
-  const led = must("ledBrightness");
-  led.addEventListener("input", () => {
-    const v = clampInt(led.value, 0, 100);
-    led.value = String(v);
-    must("ledBrightnessVal").textContent = String(v);
-    markLedDirty();
-    requestSaveLedAfterFinish();
-  });
-  led.addEventListener("change", () => {
-    markLedDirty();
-    requestSaveLedAfterFinish();
-  });
-
   // a+b led radio (exclusive)
   const abA = must("abLedA");
   const abB = must("abLedB");
@@ -1624,8 +1543,7 @@ window.addEventListener("load", async () => {
     setMsg("init… ⚙️");
     await loadMeta();
     await loadLayout();
-    await loadLedBrightness();
-    await loadExpfs();
+await loadExpfs();
 
     setupUI();
     makeGrid();

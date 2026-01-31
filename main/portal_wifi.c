@@ -1076,6 +1076,11 @@ static bool mount_spiffs(void)
     };
 
     esp_err_t e = esp_vfs_spiffs_register(&conf);
+    if (e == ESP_ERR_INVALID_STATE) {
+        // already mounted/registered
+        ESP_LOGW(TAG, "SPIFFS already mounted");
+        return true;
+    }
     if (e != ESP_OK) {
         ESP_LOGE(TAG, "SPIFFS mount failed: %s", esp_err_to_name(e));
         return false;

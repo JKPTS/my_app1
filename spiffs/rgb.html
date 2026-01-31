@@ -3,46 +3,104 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>ws2812 leds</title>
+  <title>rgb</title>
+  <link rel="stylesheet" href="style.css" />
   <style>
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:16px;max-width:820px}
-    .card{border:1px solid #ddd;border-radius:12px;padding:14px}
-    .muted{color:#666;font-size:14px}
-    button{padding:10px 14px;border-radius:10px;border:1px solid #ccc;background:#f7f7f7;cursor:pointer}
-    button:active{transform:translateY(1px)}
-    code{background:#f3f3f3;padding:2px 6px;border-radius:6px}
-    a{color:#06c}
-    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-top:10px}
-    .cell{border:1px solid #e6e6e6;border-radius:12px;padding:10px;display:flex;gap:10px;align-items:center;justify-content:space-between}
-    .idx{font-weight:700}
-    input[type="color"]{width:54px;height:34px;border:none;background:transparent;padding:0}
-    .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+    /* small additions to match existing theme */
+    /* leds: 4 per row (desktop), 2 per row (tablet), 1 per row (phone) */
+    .rgbGrid{ display:grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap:12px; }
+    @media (max-width: 920px){ .rgbGrid{ grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+    @media (max-width: 520px){ .rgbGrid{ grid-template-columns: repeat(1, minmax(0, 1fr)); } }
+
+    /* switch-like led card */
+    .rgbCell{
+      border:1px solid var(--line);
+      background: rgba(255,255,255,.03);
+      border-radius: 16px;
+      padding: 12px;
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:12px;
+      min-height: 64px;
+      cursor:pointer;
+    }
+    .rgbCell:hover{ border-color: rgba(255,255,255,.35); }
+    .rgbCell.active{ border-color: rgba(255,255,255,.65); box-shadow: 0 0 0 2px rgba(255,255,255,.10); }
+    .rgbLeft{ min-width:0; }
+    .rgbIdx{ font-weight:800; text-transform:lowercase; letter-spacing:.2px; }
+    .rgbHex{ color: var(--muted); font-size:12px; }
+    .rowActions{ display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+    .note{ color: var(--muted); font-size:12px; margin-top:10px; line-height:1.45; }
+
+    .palette{ display:flex; flex-wrap:wrap; gap:10px; padding:10px; border:1px solid var(--line); border-radius:14px; background: rgba(255,255,255,.03); }
+    .swatch{
+      width:34px; height:34px; border-radius:999px; cursor:pointer;
+      border:1px solid rgba(255,255,255,.18);
+      box-shadow: inset 0 0 0 2px rgba(0,0,0,.25);
+      transition: transform .06s ease;
+    }
+    .swatch:hover{ transform: scale(1.06); }
+    .swatch.sel{ outline:2px solid rgba(255,255,255,.9); outline-offset:2px; }
+    .pill{ font-size:11px; padding:4px 8px; border-radius:999px; border:1px solid var(--line); color: var(--muted); }
+    .colorDot{ width:22px; height:22px; border-radius:999px; border:1px solid rgba(255,255,255,.22); box-shadow: inset 0 0 0 2px rgba(0,0,0,.25); }
+    .hint{ color: var(--muted); font-size:12px; margin-top:8px; line-height:1.45; }
   </style>
 </head>
 <body>
-  <h2>ws2812 / neopixel 🎨</h2>
-  <p class="muted">
-    ปรับ <b>สีแยกแต่ละดวง</b> ได้ ✅ (สีจะถูกใช้เมื่อดวงนั้นถูกสั่ง <b>on</b> โดยฟังก์ชันในโปรแกรมคุณ)<br/>
-    ความสว่างยังใช้ตัวเดิมที่หน้า <code>/</code> (api <code>/api/led</code>)
-  </p>
+  <div class="app">
+    <header class="top">
+      <div class="brand">
+        <span class="dot" aria-hidden="true"></span>
+        <div class="brandText">
+          <div class="title">footswitch midi</div>
+          <div class="sub">rgb editor</div>
+        </div>
+      </div>
 
-  <div class="card">
-    <div class="row">
-      <button id="btnLoad">reload</button>
-      <button id="btnSaveAll">save all</button>
-      <span id="status" class="muted"></span>
-    </div>
+      <div style="display:flex; gap:10px; flex-wrap:wrap;">
+        <a class="btn2" href="/">back</a>
+      </div>
+    </header>
 
-    <div id="grid" class="grid"></div>
+    <section class="card">
+      <div class="cardHead">
+        <div class="cardTitle">rgb</div>
+        <div id="status" class="msg ok"></div>
+      </div>
 
-    <p class="muted" style="margin-top:10px">
-      api: <code>GET /api/rgb</code> → <code>{count, colors[]}</code><br/>
-      api: <code>POST /api/rgb</code> → <code>{idx, hex}</code> หรือ <code>{colors:[...]}</code>
-    </p>
 
-    <p class="muted">
-      <a href="/">← back</a>
-    </p>
+      <!-- brightness: move to top and autosave -->
+      <div class="ctrl" style="margin-bottom:12px;">
+        <div class="ctrlLabel">led brightness</div>
+        <div class="ctrlBox">
+          <div class="ctrlMid">
+            <div class="ctrlName"><span id="ledBrightnessVal">100</span>%</div>
+            <div class="ctrlNum">0–100</div>
+          </div>
+          <div style="flex:1">
+            <input id="ledBrightness" type="range" min="0" max="100" step="1" value="100" style="width:100%" />
+          </div>
+        </div>
+      </div>
+
+      <!-- colors + led selection: merged -->
+      <div class="ctrl">
+        <div class="ctrlLabel">leds</div>
+        <div class="hint" style="margin:0 0 10px 0;">
+          1) แตะ <b>led</b> เพื่อเลือก (กรอบจะสว่างขึ้น) · 2) แตะ <b>สีวงกลม</b> เพื่อเซฟอัตโนมัติ ✅
+        </div>
+        <div id="palette" class="palette" aria-label="color palette"></div>
+        <div style="height:12px"></div>
+        <div id="grid" class="rgbGrid"></div>
+      </div>
+
+      <div class="note">
+        เลือกสีจาก <b>พาเลต (วงกลม)</b> เท่านั้น ✅ เพื่อให้สี “ดูตรงตา” และใช้งานง่ายขึ้น<br/>
+        api: <code>GET /api/rgb</code> → <code>{count, colors[]}</code> · <code>POST /api/rgb</code> → <code>{idx, hex}</code> หรือ <code>{colors:[...]}</code><br/>
+        api: <code>GET /api/led</code> → <code>{brightness}</code> · <code>POST /api/led</code> → <code>{brightness}</code>
+      </div>
+    </section>
   </div>
 
   <script src="/rgb.js"></script>
