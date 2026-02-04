@@ -372,237 +372,302 @@ function mkActionRow(action, onRemove, onDirtyBtn, onFinishBtn, onImmediateSaveB
   b.value = (action.b ?? 0);
 
   const c = document.createElement("input");
-  c.type = "number"; c.min = 0; c.max = 0;
-  c.value = "0";
+  c.type = "number"; c.min = 0; c.max = 127;
+  c.value = (action.c ?? 0);
 
   const rm = document.createElement("button");
-  rm.className = "x";
-  rm.textContent = "×";
+  rm.className = "btn2 danger";
   rm.type = "button";
-  rm.onclick = async () => {
-    try {
-      onRemove(row);
-      await onImmediateSaveBtn?.();
-    } catch (e) {
-      setMsg("save failed: " + e.message, false);
-    }
+  rm.textContent = "remove";
+  rm.onclick = () => {
+    onRemove();
+    onDirtyBtn?.();
+    onFinishBtn?.();
   };
 
-  const fType = mkField("action", type);
-  const fCh   = mkField("ch", ch);
-  const fA    = mkField("cc#", a);
-  const fB    = mkField("value", b);
-
-  function refresh() {
-    setInputVisible(ch, true);
+  // show/hide fields based on type
+  function refreshFields() {
+    const isCC = (type.value === "cc");
+    // CC: ch, a=cc#, b=value, c=value2
+    // PC: ch, a=program  (we'll keep b/c hidden)
     setInputVisible(a, true);
-    setInputVisible(b, true);
-    setInputVisible(c, false);
-
-    if (type.value === "cc") {
-      ch.placeholder = "ch";
-      a.placeholder = "cc#";
-      b.placeholder = "value";
-      a.min = 0; a.max = 127;
-      b.min = 0; b.max = 127;
-
-      fA._lbl.textContent = "cc#";
-      fB._lbl.textContent = "value";
-      fB.style.display = "";
-    } else {
-      ch.placeholder = "ch";
-      a.placeholder = "program";
-      b.placeholder = "";
-      a.min = 0; a.max = 127;
-
-      setInputVisible(b, false);
-      fA._lbl.textContent = "program";
-      fB.style.display = "none";
-    }
+    setInputVisible(b, isCC);
+    setInputVisible(c, isCC);
   }
+  refreshFields();
 
-  function getClamped() {
-    const t = type.value;
-    let _ch = clampInt(ch.value || 1, 1, 16);
-    let _a = clampInt(a.value || 0, 0, 127);
-    let _b = clampInt(b.value || 0, 0, 127);
+  // ✅ save strategy:
+  // - input => mark dirty (no network)
+  // - change/blur => schedule save (non-blocking)
+  [type, ch, a, b, c].forEach((el) => {
+    el.addEventListener("input", () => onDirtyBtn?.());
+    el.addEventListener("change", () => onFinishBtn?.());
+    el.addEventListener("blur", () => onFinishBtn?.());
+  });
 
-    if (t !== "cc") _b = 0;
-
-    ch.value = String(_ch);
-    a.value = String(_a);
-    b.value = String(_b);
-    c.value = "0";
-
-    return { type: t, ch: _ch, a: _a, b: _b, c: 0 };
-  }
-
-  row._get = () => getClamped();
-
-  type.onchange = async () => {
-    try {
-      refresh();
-      await onImmediateSaveBtn?.();
-    } catch (e) {
-      setMsg("save failed: " + e.message, false);
-    }
+  type.onchange = () => {
+    refreshFields();
+    onDirtyBtn?.();
+    onFinishBtn?.();
   };
 
-  [ch, a, b].forEach((inp) => hookFinishedTypingInput(inp, onDirtyBtn, onFinishBtn));
+  // layout
+  const grid = document.createElement("div");
+  grid.className = "actionGrid";
 
-  refresh();
-  row.append(fType, fCh, fA, fB, c, rm);
-  return row;
-}
+  // ✅ label wrappers
+  const fType = mkField("type", type);
+  const fCh   = mkField("ch", ch);
+  const fA    = mkField("a", a);
+  const fB    = mkField("b", b);
+  const fC    = mkField("c", c);
 
-function renderActions(listEl, actions, onDirtyBtn, onFinishBtn, onImmediateSaveBtn) {
-  listEl.innerHTML = "";
-  (actions || []).forEach((act) => {
-    const row = mkActionRow(act, (r) => r.remove(), onDirtyBtn, onFinishBtn, onImmediateSaveBtn);
-    listEl.appendChild(row);
+  // prettier widths (keep old look)
+  [type, ch, a, b, c].forEach((el) => el.classList.add("mini"));
+  rm.classList.add("miniBtn");
+
+  grid.append(fType, fCh, fA, fB, fC, rm);
+  row.appendChild(grid);
+
+  // expose for collecting
+  row._get = () => ({
+    type: type.value,
+    ch: clampInt(ch.value, 1, 16),
+    a: clampInt(a.value, 0, 127),
+    b: clampInt(b.value, 0, 127),
+    c: clampInt(c.value, 0, 127),
   });
+
+  return row;
 }
 
 function collectActions(listEl) {
   const rows = Array.from(listEl.querySelectorAll(".action"));
-  return rows.map((r) => r._get());
+  return rows.map((r) => r._get()).filter(Boolean);
 }
 
-function listCount(listEl) {
-  return listEl.querySelectorAll(".action").length;
+function renderActions(listEl, arr, onDirtyBtn, onFinishBtn, onImmediateSaveBtn) {
+  listEl.innerHTML = "";
+  (arr || []).forEach((a) => {
+    const row = mkActionRow(
+      a,
+      () => row.remove(),
+      onDirtyBtn,
+      onFinishBtn,
+      onImmediateSaveBtn
+    );
+    listEl.appendChild(row);
+  });
 }
 
-function maxActions() {
-  return Number(META.maxActions || 20);
+function tryAddRow(listEl) {
+  if (!MAP) return;
+
+  const maxA = Number(META.maxActions || 20);
+  const curCount = listEl.querySelectorAll(".action").length;
+  if (curCount >= maxA) {
+    setMsg("max actions reached", false);
+    return;
+  }
+
+  const a = { type: "cc", ch: 1, a: 0, b: 0, c: 0 };
+  const row = mkActionRow(
+    a,
+    () => row.remove(),
+    () => markBtnDirty(),
+    () => requestSaveButtonAfterFinish(),
+    () => saveButtonImmediate()
+  );
+  listEl.appendChild(row);
+  markBtnDirty();
+  requestSaveButtonAfterFinish();
 }
 
-// ---- a+b led ui helpers ----
-function setAbLedUI(sel01) {
-  const a = must("abLedA");
-  const b = must("abLedB");
-  const v = clampInt(sel01 ?? 1, 0, 1);
-  a.checked = (v === 0);
-  b.checked = (v === 1);
-}
-
-function getAbLedUI() {
-  return must("abLedB").checked ? 1 : 0;
-}
-
-function ensureAbLedDefaultIfNeeded() {
-  const a = must("abLedA");
-  const b = must("abLedB");
-  if (!a.checked && !b.checked) b.checked = true;
-}
-
+// ---------- mode UI (short/long/a+b/group led) ----------
 function updateModeUI() {
   const pm = Number(must("pressMode").value || "0");
-  const paneRight = must("paneRight");
-  const leftTitle = must("leftTitle");
-  const rightTitle = must("rightTitle");
-  const addRight = must("addRight");
-  const addLeft = must("addLeft");
 
-  const abWrap = must("abLedWrap");
+  // right pane visibility
+  const pr = must("paneRight");
+  pr.style.display = (pm === 0) ? "none" : "";
+
+  // titles and add buttons
+  const rightTitle = must("rightTitle");
+  const leftTitle = must("leftTitle");
+  const addRight = must("addRight");
 
   if (pm === 0) {
-    paneRight.style.display = "none";
-    addRight.style.display = "none";
     leftTitle.textContent = "commands";
-    addLeft.textContent = `+ add (max ${maxActions()})`;
-    abWrap.style.display = "none";
+    addRight.style.display = "none";
   } else if (pm === 1) {
-    paneRight.style.display = "";
-    addRight.style.display = "";
     leftTitle.textContent = "short";
-    rightTitle.textContent = `long (${META.longMs || 400}ms)`;
-    addLeft.textContent = `+ add short (max ${maxActions()})`;
-    addRight.textContent = `+ add long (max ${maxActions()})`;
-    abWrap.style.display = "none";
-  } else if (pm === 2) {
-    paneRight.style.display = "";
+    rightTitle.textContent = "long";
     addRight.style.display = "";
+  } else if (pm === 2) {
     leftTitle.textContent = "a";
     rightTitle.textContent = "b";
-    addLeft.textContent = `+ add a (max ${maxActions()})`;
-    addRight.textContent = `+ add b (max ${maxActions()})`;
+    addRight.style.display = "";
+  } else if (pm === 3) {
+    leftTitle.textContent = "commands";
+    rightTitle.textContent = "group led";
+    addRight.style.display = "";
+  }
 
-    abWrap.style.display = "block";
-    ensureAbLedDefaultIfNeeded();
-  } else {
-    paneRight.style.display = "none";
-    addRight.style.display = "none";
-    leftTitle.textContent = "group (short)";
-    addLeft.textContent = `+ add (max ${maxActions()})`;
-    abWrap.style.display = "none";
+  // a+b led selector
+  const ab = must("abLedWrap");
+  ab.style.display = (pm === 2) ? "" : "none";
+
+  // ensure radio matches current config if loaded
+  if (pm === 2 && MAP && MAP.abLedSel != null) {
+    const v = Number(MAP.abLedSel) ? 1 : 0;
+    must("abLedA").checked = (v === 0);
+    must("abLedB").checked = (v === 1);
   }
 }
 
-function applyUIFromMap(m) {
-  must("pressMode").value = String(m.pressMode ?? 0);
+function fsEditorUpdateMode(paneRight, addLeft, addRight, leftTitle, rightTitle, pressMode) {
+  paneRight.style.display = (pressMode === 0) ? "none" : "";
+  addRight.style.display = (pressMode === 0) ? "none" : "";
 
-  renderActions(
-    must("shortList"),
-    m.short || [],
-    markButtonDirty,
-    requestSaveButtonAfterFinish,
-    saveButtonImmediate
-  );
-  renderActions(
-    must("longList"),
-    m.long || [],
-    markButtonDirty,
-    requestSaveButtonAfterFinish,
-    saveButtonImmediate
-  );
-
-  setAbLedUI(m.abLed ?? 1);
-  updateModeUI();
+  if (pressMode === 0) {
+    leftTitle.textContent = "commands";
+  } else if (pressMode === 1) {
+    leftTitle.textContent = "short";
+    rightTitle.textContent = "long";
+  } else {
+    leftTitle.textContent = "a";
+    rightTitle.textContent = "b";
+  }
 }
 
-function readUIToMap() {
+function tryAddRowExp(listEl, port) {
+  const maxA = Number(META.maxActions || 20);
+  const curCount = listEl.querySelectorAll(".action").length;
+  if (curCount >= maxA) {
+    setMsg("max actions reached", false);
+    return;
+  }
+
+  const a = { type: "cc", ch: 1, a: 0, b: 0, c: 0 };
+  const row = mkActionRow(
+    a,
+    () => row.remove(),
+    () => markExpfsDirty(port),
+    () => requestSaveExpfsAfterFinish(port),
+    () => saveExpfsPortImmediate(port)
+  );
+  listEl.appendChild(row);
+  markExpfsDirty(port);
+  requestSaveExpfsAfterFinish(port);
+}
+
+// ---------- store -> UI ----------
+async function loadMeta() {
+  META = await apiGet("/api/meta");
+}
+
+async function loadLayout() {
+  LAYOUT = await apiGet("/api/layout");
+
+  // bank dropdown
+  const sel = must("bankSelect");
+  sel.innerHTML = "";
+  const bc = Number(LAYOUT.bankCount || 1);
+  for (let i = 0; i < bc; i++) {
+    const b = (LAYOUT.banks || [])[i] || { name: `Bank ${i + 1}` };
+    const opt = document.createElement("option");
+    opt.value = String(i);
+    opt.textContent = `#${i} · ${b.name || "bank"}`;
+    sel.appendChild(opt);
+  }
+}
+
+async function loadBankData(bank) {
+  BANKDATA = await apiGet(`/api/bank?bank=${bank}`);
+}
+
+async function loadButton() {
+  MAP = await apiGet(`/api/btn?bank=${cur.bank}&btn=${cur.btn}`);
+  renderButtonConfig();
+}
+
+function renderButtonConfig() {
+  if (!MAP) return;
+
+  LOADING = true;
+  try {
+    // press mode
+    must("pressMode").value = String(MAP.pressMode ?? 0);
+
+    // ab led
+    const ab = Number(MAP.abLedSel ?? 0);
+    must("abLedA").checked = (ab === 0);
+    must("abLedB").checked = (ab === 1);
+
+    // actions
+    renderActions(
+      must("shortList"),
+      MAP.short || [],
+      () => markBtnDirty(),
+      () => requestSaveButtonAfterFinish(),
+      () => saveButtonImmediate()
+    );
+    renderActions(
+      must("longList"),
+      MAP.long || [],
+      () => markBtnDirty(),
+      () => requestSaveButtonAfterFinish(),
+      () => saveButtonImmediate()
+    );
+
+    updateModeUI();
+  } finally {
+    LOADING = false;
+  }
+}
+
+// ---------- UI -> store payload ----------
+function readButtonFromUI() {
   const pm = Number(must("pressMode").value || "0");
-  let shortArr = collectActions(must("shortList"));
-  let longArr = (pm === 0 || pm === 3) ? [] : collectActions(must("longList"));
+  const shortArr = collectActions(must("shortList"));
+  const longArr = (pm === 0) ? [] : collectActions(must("longList"));
 
-  return {
-    pressMode: pm,
-    ccBehavior: 0,
-    abLed: (pm === 2) ? getAbLedUI() : 1,
-    short: shortArr,
-    long: longArr,
-  };
+  let abLedSel = 0;
+  if (pm === 2) {
+    abLedSel = must("abLedB").checked ? 1 : 0;
+  }
+
+  return { pressMode: pm, abLedSel, short: shortArr, long: longArr };
 }
 
-// ---------- non-blocking autosave ----------
-function markButtonDirty() {
+// ---------- dirty + autosave controllers ----------
+function markBtnDirty() {
   if (LOADING) return;
   dirtyBtn = true;
-  btnVer++;
+  btnVer += 1;
   setMsg("editing… ✍️");
 }
 
 function markLayoutDirty() {
   if (LOADING) return;
   dirtyLayout = true;
-  layoutVer++;
+  layoutVer += 1;
   setMsg("editing… ✍️");
 }
 
 function markBankDirty() {
   if (LOADING) return;
   dirtyBank = true;
-  bankVer++;
+  bankVer += 1;
   setMsg("editing… ✍️");
 }
 
 function requestSaveButtonAfterFinish() {
   if (LOADING) return;
   if (!dirtyBtn) return;
-
   if (btnSaving) return;
-  btnSaving = true;
 
+  btnSaving = true;
   btnSavePromise = (async () => {
     while (true) {
       const v = btnVer;
@@ -626,10 +691,9 @@ function requestSaveButtonAfterFinish() {
 function requestSaveLayoutAfterFinish() {
   if (LOADING) return;
   if (!dirtyLayout) return;
-
   if (layoutSaving) return;
-  layoutSaving = true;
 
+  layoutSaving = true;
   layoutSavePromise = (async () => {
     while (true) {
       const v = layoutVer;
@@ -653,10 +717,9 @@ function requestSaveLayoutAfterFinish() {
 function requestSaveBankAfterFinish() {
   if (LOADING) return;
   if (!dirtyBank) return;
-
   if (bankSaving) return;
-  bankSaving = true;
 
+  bankSaving = true;
   bankSavePromise = (async () => {
     while (true) {
       const v = bankVer;
@@ -677,6 +740,7 @@ function requestSaveBankAfterFinish() {
   })();
 }
 
+// ---------- immediate save wrappers ----------
 async function saveButtonImmediate() {
   if (LOADING) return;
   dirtyBtn = true;
@@ -778,247 +842,100 @@ function refreshBankDropdown() {
   sel.value = String(cur.bank);
 }
 
-async function loadLayout() {
-  LAYOUT = await apiGet("/api/layout");
-
-  const bc = Number(LAYOUT.bankCount || 1);
-  LAYOUT.bankCount = bc;
-
-  const rawBanks = (LAYOUT.banks || []).slice(0, bc);
-  LAYOUT.banks = rawBanks.map((b, idx) => {
-    return {
-      index: idx,
-      name: clipText((b && b.name) ? b.name : ("Bank " + (idx + 1)), MAX_BANK_NAME),
-    };
-  });
-
-  while (LAYOUT.banks.length < bc) {
-    const idx = LAYOUT.banks.length;
-    LAYOUT.banks.push({
-      index: idx,
-      name: clipText("Bank " + (idx + 1), MAX_BANK_NAME),
-    });
-  }
-
-  cur.bank = wrap(cur.bank, LAYOUT.bankCount);
-  refreshLayoutButtons();
-  refreshBankDropdown();
+async function saveButton() {
+  const payload = readButtonFromUI();
+  await apiPost(`/api/btn?bank=${cur.bank}&btn=${cur.btn}`, payload);
+  MAP = payload;
 }
 
 async function saveLayout() {
-  const payload = {
-    bankCount: LAYOUT.bankCount,
-    banks: LAYOUT.banks.map((b, idx) => ({
-      index: idx,
-      name: clipText(b.name, MAX_BANK_NAME),
-    })),
-  };
-  await apiPost("/api/layout", payload);
-}
-
-async function loadBank() {
-  const url = `/api/bank?bank=${cur.bank}`;
-  BANKDATA = await apiGet(url);
-
-  if (!BANKDATA || typeof BANKDATA !== "object") BANKDATA = { switchNames: [] };
-  if (!Array.isArray(BANKDATA.switchNames)) BANKDATA.switchNames = [];
-
-  BANKDATA.switchNames = BANKDATA.switchNames
-    .slice(0, Number(META.buttons || 8))
-    .map((s, i) => {
-      const v = clipText(s, MAX_SWITCH_NAME);
-      return v || `SW${i + 1}`;
-    });
-
-  while (BANKDATA.switchNames.length < Number(META.buttons || 8)) {
-    BANKDATA.switchNames.push(`SW${BANKDATA.switchNames.length + 1}`);
-  }
-
-  renderGridLabels();
+  await apiPost("/api/layout", LAYOUT);
 }
 
 async function saveBank() {
-  const payload = {
-    switchNames: (BANKDATA.switchNames || [])
-      .slice(0, Number(META.buttons || 8))
-      .map((s) => clipText(s, MAX_SWITCH_NAME)),
-  };
-  await apiPost(`/api/bank?bank=${cur.bank}`, payload);
+  await apiPost(`/api/bank?bank=${cur.bank}`, BANKDATA);
 }
 
-async function loadButton() {
-  LOADING = true;
-  try {
-    renderHeader();
-    refreshLayoutButtons();
-
-    await loadBank();
-
-    const url = `/api/button?bank=${cur.bank}&btn=${cur.btn}`;
-    MAP = await apiGet(url);
-
-    if (!MAP || typeof MAP !== "object") MAP = { pressMode: 0, short: [], long: [], abLed: 1 };
-    if (!Array.isArray(MAP.short)) MAP.short = [];
-    if (!Array.isArray(MAP.long)) MAP.long = [];
-
-    applyUIFromMap(MAP);
-    highlightGrid();
-    renderHeader();
-
-    dirtyBtn = false; dirtyLayout = false; dirtyBank = false;
-  } finally {
-    LOADING = false;
-  }
-}
-
-async function saveButton() {
-  const url = `/api/button?bank=${cur.bank}&btn=${cur.btn}`;
-  const payload = readUIToMap();
-  await apiPost(url, payload);
-}
-
-// ---------- sync bank web <-> hw ----------
-async function setHardwareState() {
-  await apiPost("/api/state", { bank: cur.bank });
-}
-
-async function gotoBank(bank) {
+async function gotoBank(b) {
   await flushPendingSaves();
 
-  lastUserNavAt = nowMs();
-  cur.bank = wrap(bank, LAYOUT.bankCount);
-  cur.btn = wrap(cur.btn, Number(META.buttons || 8));
+  cur.bank = wrap(b, LAYOUT.bankCount || 1);
+  cur.btn = clampInt(cur.btn, 0, Number(META.buttons || 8) - 1);
 
-  await setHardwareState();
+  lastUserNavAt = nowMs();
+
+  await loadBankData(cur.bank);
+  renderGridLabels();
+  highlightGrid();
+  renderHeader();
+  refreshLayoutButtons();
+  refreshBankDropdown();
+
   await loadButton();
 }
 
-// ---------- add/remove helpers (insert after current) ----------
-function reindexBanks() {
-  (LAYOUT.banks || []).forEach((b, idx) => { b.index = idx; });
-}
-
 function insertBankAfterCurrent() {
-  const pos = Math.min(LAYOUT.bankCount, cur.bank + 1);
-  const newBank = {
-    index: pos,
-    name: clipText(`Bank ${pos + 1}`, MAX_BANK_NAME),
-  };
-  LAYOUT.banks.splice(pos, 0, newBank);
-  LAYOUT.bankCount += 1;
-  reindexBanks();
-  return pos;
+  const bc = Number(LAYOUT.bankCount || 1);
+  const idx = clampInt(cur.bank + 1, 1, bc);
+
+  const newBank = { index: idx, name: "new bank" };
+  const banks = Array.isArray(LAYOUT.banks) ? LAYOUT.banks : [];
+  banks.splice(idx, 0, newBank);
+
+  // reindex
+  banks.forEach((b, i) => b.index = i);
+  LAYOUT.banks = banks;
+  LAYOUT.bankCount = bc + 1;
+
+  return idx;
 }
 
 function deleteCurrentBank() {
-  if (LAYOUT.bankCount <= 1) throw new Error("need at least 1 bank");
-  LAYOUT.banks.splice(cur.bank, 1);
-  LAYOUT.bankCount -= 1;
-  reindexBanks();
-  cur.bank = Math.min(cur.bank, LAYOUT.bankCount - 1);
-  cur.btn = wrap(cur.btn, Number(META.buttons || 8));
+  const bc = Number(LAYOUT.bankCount || 1);
+  if (bc <= 1) throw new Error("cannot delete last bank");
+
+  const banks = Array.isArray(LAYOUT.banks) ? LAYOUT.banks : [];
+  banks.splice(cur.bank, 1);
+
+  banks.forEach((b, i) => b.index = i);
+  LAYOUT.banks = banks;
+  LAYOUT.bankCount = bc - 1;
+
+  // adjust cur bank
+  if (cur.bank >= LAYOUT.bankCount) cur.bank = LAYOUT.bankCount - 1;
 }
 
-function tryAddRow(listEl) {
-  if (listCount(listEl) >= maxActions()) {
-    setMsg(`max actions reached (${maxActions()})`, false);
-    return;
-  }
-
-  const row = mkActionRow(
-    { type: "cc", ch: 1, a: 0, b: 127, c: 0 },
-    (r) => r.remove(),
-    markButtonDirty,
-    requestSaveButtonAfterFinish,
-    saveButtonImmediate
-  );
-  listEl.appendChild(row);
-
-  saveButtonImmediate().catch((e) => setMsg("save failed: " + e.message, false));
-}
-
-// ---------- live poll (hardware -> web sync) ----------
+// ---------- live state polling ----------
 async function pollLive() {
   try {
     const st = await apiGet("/api/state");
-    must("liveBank").textContent = st.bank;
-
-    const b = wrap(st.bank, LAYOUT.bankCount);
-
-    if ((nowMs() - lastUserNavAt) > 800) {
-      if (b !== cur.bank) {
-        await flushPendingSaves();
-        cur.bank = b;
-        cur.btn = wrap(cur.btn, Number(META.buttons || 8));
-        await loadButton();
-        setMsg("synced ✅");
-      }
-    }
+    must("liveBank").textContent = String(st.bank ?? 0);
   } catch (_) {}
-  setTimeout(pollLive, 450);
+  setTimeout(pollLive, 800);
 }
-
 
 // ---------- exp/fs UI ----------
 function mkSelect(opts, value) {
   const s = document.createElement("select");
-  (opts || []).forEach(([v, t]) => {
+  for (const [v, t] of opts) {
     const o = document.createElement("option");
     o.value = String(v);
-    o.textContent = t;
+    o.textContent = String(t);
     s.appendChild(o);
-  });
-  if (value != null) s.value = String(value);
+  }
+  s.value = String(value ?? opts?.[0]?.[0] ?? "");
   return s;
 }
 
-function mkNumberInput(v, min, max, step=1) {
+function mkNumberInput(val, min, max, step) {
   const i = document.createElement("input");
   i.type = "number";
-  i.min = String(min);
-  i.max = String(max);
-  i.step = String(step);
-  i.value = String(v ?? "");
+  i.value = String(val ?? 0);
+  if (min != null) i.min = String(min);
+  if (max != null) i.max = String(max);
+  if (step != null) i.step = String(step);
+  i.classList.add("mini");
   return i;
-}
-
-function fsEditorUpdateMode(paneRight, addLeft, addRight, leftTitle, rightTitle, pm) {
-  if (pm === 0) {
-    paneRight.style.display = "none";
-    addRight.style.display = "none";
-    leftTitle.textContent = "commands";
-    addLeft.textContent = `+ add (max ${maxActions()})`;
-  } else if (pm === 1) {
-    paneRight.style.display = "";
-    addRight.style.display = "";
-    leftTitle.textContent = "short";
-    rightTitle.textContent = `long (${META.longMs || 400}ms)`;
-    addLeft.textContent = `+ add short (max ${maxActions()})`;
-    addRight.textContent = `+ add long (max ${maxActions()})`;
-  } else {
-    paneRight.style.display = "";
-    addRight.style.display = "";
-    leftTitle.textContent = "a";
-    rightTitle.textContent = "b";
-    addLeft.textContent = `+ add a (max ${maxActions()})`;
-    addRight.textContent = `+ add b (max ${maxActions()})`;
-  }
-}
-
-function tryAddRowExp(listEl, port) {
-  if (listCount(listEl) >= maxActions()) {
-    setMsg(`max actions reached (${maxActions()})`, false);
-    return;
-  }
-  const row = mkActionRow(
-    { type: "cc", ch: 1, a: 0, b: 127, c: 0 },
-    (r) => r.remove(),
-    () => markExpfsDirty(port),
-    () => requestSaveExpfsAfterFinish(port),
-    () => saveExpfsPortImmediate(port)
-  );
-  listEl.appendChild(row);
-  saveExpfsPortImmediate(port).catch((e) => setMsg("save failed: " + e.message, false));
 }
 
 function buildFsEditor(port, side /*"tip"|"ring"*/, cfg) {
@@ -1167,7 +1084,7 @@ function buildExpEditor(port, cfg) {
     mkField("val2", v2Inp),
   );
 
-    const calRow = document.createElement("div");
+  const calRow = document.createElement("div");
   calRow.className = "calRow";
 
   const calBtn = document.createElement("button");
@@ -1396,8 +1313,13 @@ function buildExpfsPortUI(port, cfg) {
 }
 
 function readExpfsPortFromUI(port) {
-  const w = must("expfsWrap");
-  const portEl = w.querySelector(`.expPort[data-port="${port}"]`);
+  // IMPORTANT:
+  // index.html has a "splitter" script that MOVES rendered .expPort nodes
+  // out of #expfsWrap into #expfsPane1 / #expfsPane2.
+  // So querying only inside #expfsWrap will fail after that move, making the
+  // save path accidentally send the old cached EXPFS[port] instead of reading
+  // the current UI state.
+  const portEl = document.querySelector(`.expPort[data-port="${port}"]`);
   if (!portEl || !portEl._get) return EXPFS[port] || null;
   return portEl._get();
 }
@@ -1543,7 +1465,7 @@ window.addEventListener("load", async () => {
     setMsg("init… ⚙️");
     await loadMeta();
     await loadLayout();
-await loadExpfs();
+    await loadExpfs();
 
     setupUI();
     makeGrid();
